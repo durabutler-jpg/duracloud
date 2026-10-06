@@ -121,7 +121,7 @@ class Report(Base):
     __tablename__="reports"
     id=Column(Integer,primary_key=True); reporter_id=Column(Integer,ForeignKey("users.id"),nullable=False); target_type=Column(String(30),nullable=False); target_id=Column(Integer,nullable=False); reason=Column(String(300),default=""); status=Column(String(30),default="open"); created_at=Column(DateTime,default=datetime.utcnow)
 
-app=FastAPI(title="Dura Cloud",version="4.1")
+app=FastAPI(title="Dura Cloud",version="4.2")
 
 def db():
     d=SessionLocal()
@@ -210,9 +210,9 @@ def bootstrap():
 
 @app.get("/")
 def status():
-    return {"service":"Dura Cloud","version":"4.1","status":"online" if DATABASE_READY else "degraded",
-            "release":"publish-candidate-2","duratube":True,"studio":True,"duramail":True,
-            "duraia":"DuraBrain Local 1.1","database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
+    return {"service":"Dura Cloud","version":"4.2","status":"online" if DATABASE_READY else "degraded",
+            "release":"ui-rebuild-candidate","duratube":True,"studio":True,"duramail":True,
+            "duraia":"DuraBrain Local 1.2","database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
             "warnings":CONFIG_WARNINGS}
 
 @app.get("/health")
@@ -227,13 +227,13 @@ def health():
     r2_cfg=bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET)
     secret_persistent=bool(os.getenv("DURA_SECRET","").strip())
     return {"ok":db_ok,"database":db_ok,"r2_configured":r2_cfg,"secret_persistent":secret_persistent,
-            "warnings":CONFIG_WARNINGS,"version":"4.1"}
+            "warnings":CONFIG_WARNINGS,"version":"4.2"}
 
 @app.get("/ready")
 def ready():
     if not DATABASE_READY:
         raise HTTPException(503,"Dura Cloud démarre mais la base de données n'est pas prête. Consulte /health et les logs Render.")
-    return {"ready":True,"version":"4.1"}
+    return {"ready":True,"version":"4.2"}
 
 @app.patch("/account/profile")
 def update_profile(x:ProfileIn,u:User=Depends(me),d:Session=Depends(db)):
@@ -430,12 +430,20 @@ def videos(q:str="",short:int=-1,owner_id:int=0,d:Session=Depends(db)):
     rows=x.all();rows.sort(key=lambda v:(bool(v.is_featured),v.id),reverse=True);return [pub_video(v) for v in rows]
 @app.get("/feed")
 def feed(d:Session=Depends(db)):
-    rows=d.query(Video).filter(Video.status=="published").all();active={p.video_id:p for p in d.query(Promotion).filter(Promotion.status=="active").all() if p.delivered_impressions<p.target_impressions}
+    rows=d.query(Video).filter(Video.status=="published",Video.is_short==False).all();active={p.video_id:p for p in d.query(Promotion).filter(Promotion.status=="active").all() if p.delivered_impressions<p.target_impressions}
     rows.sort(key=lambda v:((1000000 if v.is_featured else 0)+(500000 if v.id in active else 0)+(v.views or 0)+(v.likes or 0)*5+v.id),reverse=True)
     for v in rows[:30]:
         p=active.get(v.id)
         if p:p.delivered_impressions+=1;p.status="completed" if p.delivered_impressions>=p.target_impressions else "active"
     d.commit();return [pub_video(v)|{"promoted":v.id in active} for v in rows[:30]]
+@app.get("/videos/{vid}")
+def video_details(vid:int,d:Session=Depends(db)):
+    v=d.get(Video,vid)
+    if not v or v.status!="published":raise HTTPException(404)
+    owner=d.get(User,v.owner_id)
+    subs=d.query(Subscription).filter_by(channel_id=v.owner_id).count()
+    return pub_video(v)|{"subscribers":subs,"owner":pub_user(owner) if owner else None}
+
 @app.get("/videos/{vid}/file")
 def video_file(vid:int,d:Session=Depends(db)):
     v=d.get(Video,vid)
@@ -481,13 +489,26 @@ def delete_video(vid:int,u:User=Depends(me),d:Session=Depends(db)):
     d.delete(v);d.commit();return {"ok":True}
 @app.get("/videos/{vid}/comments")
 def comments(vid:int,d:Session=Depends(db)):
-    return [{"id":c.id,"username":d.get(User,c.user_id).channel_name or d.get(User,c.user_id).display_name,"content":c.content,"created_at":c.created_at.isoformat()} for c in d.query(Comment).filter_by(video_id=vid).order_by(Comment.id.desc()).all()]
+    out=[]
+    for c in d.query(Comment).filter_by(video_id=vid).order_by(Comment.id.desc()).all():
+        author=d.get(User,c.user_id)
+        out.append({"id":c.id,"user_id":c.user_id,"username":(author.channel_name or author.display_name) if author else "Utilisateur","official":bool(author and author.is_official),"content":c.content,"created_at":c.created_at.isoformat()})
+    return out
 @app.post("/videos/{vid}/comments")
 def add_comment(vid:int,content:str=Form(...),u:User=Depends(me),d:Session=Depends(db)):
     if not d.get(Video,vid):raise HTTPException(404)
     c=Comment(video_id=vid,user_id=u.id,content=content.strip()[:1000])
     if not c.content:raise HTTPException(400)
     d.add(c);d.commit();return {"ok":True}
+
+@app.get("/videos/{vid}/related")
+def related_videos(vid:int,d:Session=Depends(db)):
+    current=d.get(Video,vid)
+    if not current:raise HTTPException(404)
+    rows=d.query(Video).filter(Video.status=="published",Video.is_short==False,Video.id!=vid).all()
+    rows.sort(key=lambda v:((v.owner_id==current.owner_id),(v.likes or 0),(v.views or 0),v.id),reverse=True)
+    return [pub_video(v) for v in rows[:12]]
+
 @app.get("/channels")
 def channels(q:str="",d:Session=Depends(db)):
     x=d.query(User).filter(User.is_banned==False,User.channel_name!="")
@@ -520,7 +541,7 @@ def my_subscriptions(u:User=Depends(me),d:Session=Depends(db)):
 def studio_dashboard(u:User=Depends(me),d:Session=Depends(db)):
     if not u.channel_name:raise HTTPException(403,"Aucune chaîne.")
     vids=d.query(Video).filter_by(owner_id=u.id).order_by(Video.id.desc()).all();subs=d.query(Subscription).filter_by(channel_id=u.id).count()
-    return {"channel":u.channel_name,"subscribers":subs,"videos":len(vids),"views":sum(v.views or 0 for v in vids),"likes":sum(v.likes or 0 for v in vids),"recent":[pub_video(v) for v in vids[:8]]}
+    return {"channel":u.channel_name,"subscribers":subs,"videos":sum(1 for v in vids if not v.is_short),"shorts":sum(1 for v in vids if v.is_short),"uploads":len(vids),"views":sum(v.views or 0 for v in vids),"likes":sum(v.likes or 0 for v in vids),"recent":[pub_video(v) for v in vids[:8]]}
 @app.get("/studio/content")
 def studio_content(u:User=Depends(me),d:Session=Depends(db)):
     if not u.channel_name:raise HTTPException(403,"Aucune chaîne.")
@@ -641,8 +662,8 @@ class DuraBrain:
         return "\n".join(f"{i+1}. {f} autour de {topic}." for i,f in enumerate(frames))
     def plan(self,goal):
         return f"Objectif : {goal.strip()}\n\n1. Définir le résultat exact.\n2. Faire une version minimale testable.\n3. Tester avec un vrai utilisateur.\n4. Corriger les blocages.\n5. Ajouter les fonctions importantes.\n6. Vérifier sécurité, erreurs et sauvegardes.\n7. Préparer la publication et une checklist de lancement."
-    def answer(self,message,memories):
-        raw=message.strip();low=raw.lower();tokens=set(self.tokenize(raw))
+    def answer(self,message,memories,context=None):
+        raw=message.strip();low=raw.lower();tokens=set(self.tokenize(raw));context=context or []
         if low.startswith(("calcule ","calcul ")):
             expr=raw.split(" ",1)[1].replace("×","*").replace("÷","/").replace("^","**")
             try:return f"Résultat : {self.safe_math(expr)}"
@@ -655,9 +676,21 @@ class DuraBrain:
         if low.startswith(("réécris ","reecris ","corrige ","reformule ")):
             text=raw.split(" ",1)[1] if " " in raw else "";return self.rewrite(text)
         if low.startswith(("idées ","idees ","brainstorm ")):
-            return self.brainstorm(raw.split(" ",1)[1] if " " in raw else "")
+            topic=raw.split(" ",1)[1] if " " in raw else ""; topic=re.sub(r"^(pour|sur)\s+","",topic,flags=re.I); return self.brainstorm(topic)
         if low.startswith(("plan ","planifie ","organise ")):
             return self.plan(raw.split(" ",1)[1] if " " in raw else raw)
+        if low.startswith(("explique ","explique-moi ")):
+            subject=raw.split(" ",1)[1] if " " in raw else raw
+            return f"Explication structurée de {subject} :\n\n• Idée principale : identifie ce que c'est et à quoi ça sert.\n• Fonctionnement : découpe le sujet en étapes simples.\n• Exemple : applique-le à un cas concret.\n• Vérification : regarde ce qui peut échouer ou être mal compris.\n\nSi tu me donnes le texte ou les données exactes, je peux les restructurer directement."
+        if low.startswith(("liste ","fais une liste ")):
+            subject=raw.split(" ",1)[1] if " " in raw else raw
+            return "Liste de travail :\n"+"\n".join(f"{i}. {x}" for i,x in enumerate([f"Définir {subject}",f"Préparer les éléments nécessaires",f"Construire une première version",f"Tester le résultat",f"Corriger les problèmes",f"Finaliser et publier"],1))
+        if low.startswith(("compare ","comparaison ")):
+            subject=raw.split(" ",1)[1] if " " in raw else raw
+            return f"Comparaison de {subject} :\n\n1. Objectif\n2. Facilité d'utilisation\n3. Fonctionnalités\n4. Performances\n5. Personnalisation\n6. Coût et contraintes\n7. Meilleur choix selon l'usage"
+        if low.startswith(("titre ","titres ")):
+            topic=raw.split(" ",1)[1] if " " in raw else "ton sujet"
+            return "Propositions de titres :\n"+"\n".join([f"• {topic} : le guide complet",f"• Tout comprendre sur {topic}",f"• {topic} : ce qu'il faut savoir",f"• J'ai testé {topic}",f"• {topic}, mais en mieux"])
         if "duratube" in tokens:
             return "DuraTube est la plateforme vidéo de l'écosystème Dura. Le compte est un compte Dura @duramail, les médias sont stockés sur R2 et DuraTube Studio sert à gérer une chaîne."
         if "duramail" in tokens:
@@ -669,6 +702,9 @@ class DuraBrain:
             return "Voici ce que j'ai en mémoire :\n"+"\n".join(f"• {k} : {v}" for k,v in memories.items())
         if low in {"bonjour","salut","hello","hey","wesh"}:return "Salut. Je suis DuraIA, le moteur IA maison de l'écosystème Dura. Je peux calculer, résumer, reformuler, brainstormer, planifier et t'aider sur les apps Dura."
         if "merci" in tokens:return "Avec plaisir."
+        if any(x in low for x in ["et après","et apres","continue","suite"]) and context:
+            previous=next((m.get("content","") for m in reversed(context) if m.get("role")=="user"),"")
+            if previous:return self.plan(previous)
         # Lightweight keyword synthesis, no external provider.
         important=[w for w in self.tokenize(raw) if w not in STOPWORDS and len(w)>2][:8]
         subject=" ".join(important[:4]) or "ta demande"
@@ -684,7 +720,7 @@ def ai_memories(user_id,d):return {m.key:m.value for m in d.query(AiMemory).filt
 
 @app.get("/ai/status")
 def ai_status(u:User=Depends(me),d:Session=Depends(db)):
-    a=d.query(AiAccess).filter_by(user_id=u.id).first();return {"verified":bool(a and a.verified),"engine":"DuraBrain Local 1.1","provider_ready":True,"external_api":False}
+    a=d.query(AiAccess).filter_by(user_id=u.id).first();return {"verified":bool(a and a.verified),"engine":"DuraBrain Local 1.2","provider_ready":True,"external_api":False}
 
 @app.post("/ai/request-code")
 def ai_request_code(u:User=Depends(me),d:Session=Depends(db)):
@@ -746,6 +782,9 @@ def ai_chat(x:AiChat,u:User=Depends(me),d:Session=Depends(db)):
             else:d.add(AiMemory(user_id=u.id,key=key,value=value))
             answer=f"Je retiens : {key} = {value}."
         else:answer="Utilise par exemple : retiens que projet = DuraTube."
-    else:answer=BRAIN.answer(x.message,ai_memories(u.id,d))
+    else:
+        recent_rows=d.query(AiMessage).filter_by(conversation_id=c.id).order_by(AiMessage.id.desc()).limit(8).all()
+        recent=[{"role":m.role,"content":m.content} for m in reversed(recent_rows)]
+        answer=BRAIN.answer(x.message,ai_memories(u.id,d),recent)
     d.add(AiMessage(conversation_id=c.id,role="user",content=x.message));d.add(AiMessage(conversation_id=c.id,role="assistant",content=answer));c.updated_at=datetime.utcnow();d.commit()
-    return {"text":answer,"conversation_id":c.id,"engine":"DuraBrain Local 1.1"}
+    return {"text":answer,"conversation_id":c.id,"engine":"DuraBrain Local 1.2"}
