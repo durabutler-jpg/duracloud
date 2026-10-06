@@ -1,4 +1,4 @@
-import os, uuid, jwt, boto3, random, hashlib, ast, math, re, html
+import os, uuid, jwt, boto3, random, hashlib, ast, math, re, html, secrets, logging
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -6,21 +6,47 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, or_, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, or_, UniqueConstraint, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 
-DB_URL=os.getenv("DURA_DATABASE_URL","sqlite:///./dura_cloud.db")
-SECRET=os.getenv("DURA_SECRET","CHANGE-ME")
-R2_ENDPOINT=os.getenv("R2_ENDPOINT","")
-R2_ACCESS_KEY_ID=os.getenv("R2_ACCESS_KEY_ID","")
-R2_SECRET_ACCESS_KEY=os.getenv("R2_SECRET_ACCESS_KEY","")
-R2_BUCKET=os.getenv("R2_BUCKET_NAME","duratube-media")
+logger=logging.getLogger("duracloud")
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 
-engine=create_engine(DB_URL,connect_args={"check_same_thread":False} if DB_URL.startswith("sqlite") else {},pool_pre_ping=True)
+CONFIG_WARNINGS=[]
+
+def normalize_database_url(url:str)->str:
+    url=(url or "sqlite:///./dura_cloud.db").strip()
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg://"+url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://"+url[len("postgresql://"):]
+    return url
+
+DB_URL=normalize_database_url(os.getenv("DURA_DATABASE_URL","sqlite:///./dura_cloud.db"))
+_raw_secret=os.getenv("DURA_SECRET","").strip()
+if not _raw_secret or _raw_secret=="CHANGE-ME":
+    SECRET=secrets.token_urlsafe(48)
+    CONFIG_WARNINGS.append("DURA_SECRET absent: secret temporaire généré. Ajoute DURA_SECRET dans Render pour conserver les sessions après redémarrage.")
+elif len(_raw_secret)<32:
+    SECRET=_raw_secret
+    CONFIG_WARNINGS.append("DURA_SECRET est trop court. Le serveur démarre, mais utilise au moins 32 caractères avant publication.")
+else:
+    SECRET=_raw_secret
+
+R2_ENDPOINT=os.getenv("R2_ENDPOINT","").strip().rstrip("/")
+R2_ACCESS_KEY_ID=os.getenv("R2_ACCESS_KEY_ID","").strip()
+R2_SECRET_ACCESS_KEY=os.getenv("R2_SECRET_ACCESS_KEY","").strip()
+R2_BUCKET=os.getenv("R2_BUCKET_NAME","duratube-media").strip()
+MAX_VIDEO_MB=int(os.getenv("MAX_VIDEO_MB","2048"))
+MAX_POST_MEDIA_MB=int(os.getenv("MAX_POST_MEDIA_MB","100"))
+MAX_MAIL_ATTACHMENT_MB=int(os.getenv("MAX_MAIL_ATTACHMENT_MB","25"))
+
+engine=create_engine(DB_URL,connect_args={"check_same_thread":False} if DB_URL.startswith("sqlite") else {},pool_pre_ping=True,pool_recycle=300)
 SessionLocal=sessionmaker(bind=engine,autoflush=False,autocommit=False)
 Base=declarative_base(); ph=PasswordHasher()
+DATABASE_READY=False
 
 class User(Base):
     __tablename__="users"
@@ -95,8 +121,7 @@ class Report(Base):
     __tablename__="reports"
     id=Column(Integer,primary_key=True); reporter_id=Column(Integer,ForeignKey("users.id"),nullable=False); target_type=Column(String(30),nullable=False); target_id=Column(Integer,nullable=False); reason=Column(String(300),default=""); status=Column(String(30),default="open"); created_at=Column(DateTime,default=datetime.utcnow)
 
-Base.metadata.create_all(engine)
-app=FastAPI(title="Dura Cloud",version="4.0")
+app=FastAPI(title="Dura Cloud",version="4.1")
 
 def db():
     d=SessionLocal()
@@ -121,6 +146,12 @@ def r2():
     return boto3.client("s3",endpoint_url=R2_ENDPOINT,aws_access_key_id=R2_ACCESS_KEY_ID,aws_secret_access_key=R2_SECRET_ACCESS_KEY,region_name="auto")
 def signed(key):return r2().generate_presigned_url("get_object",Params={"Bucket":R2_BUCKET,"Key":key},ExpiresIn=3600)
 def pub_video(v):return {"id":v.id,"title":v.title,"description":v.description or "","owner_id":v.owner_id,"channel":v.channel,"views":v.views or 0,"likes":v.likes or 0,"short":bool(v.is_short),"featured":bool(v.is_featured),"media_url":f"/videos/{v.id}/file","thumbnail_url":f"/videos/{v.id}/thumbnail" if v.thumbnail_key else None,"created_at":v.created_at.isoformat() if v.created_at else ""}
+def reject_oversize(upload:UploadFile|None,max_mb:int,label:str):
+    if not upload:return
+    size=getattr(upload,"size",None)
+    if size is not None and size>max_mb*1024*1024:
+        raise HTTPException(413,f"{label} limité à {max_mb} Mo.")
+
 
 class Register(BaseModel):
     address:str; display_name:str=Field(min_length=2,max_length=80); password:str=Field(min_length=8,max_length=128); channel_name:Optional[str]=""
@@ -141,26 +172,68 @@ class ReportIn(BaseModel):target_type:str;target_id:int;reason:str=""
 
 @app.on_event("startup")
 def bootstrap():
-    if SECRET=="CHANGE-ME" or len(SECRET)<32:
-        raise RuntimeError("DURA_SECRET doit contenir au moins 32 caractères en production.")
+    global DATABASE_READY
+    try:
+        Base.metadata.create_all(engine)
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        DATABASE_READY=True
+    except Exception as exc:
+        DATABASE_READY=False
+        msg=f"Base de données indisponible au démarrage: {type(exc).__name__}: {exc}"
+        CONFIG_WARNINGS.append(msg)
+        logger.exception(msg)
+        return
     d=SessionLocal()
     try:
         u=d.query(User).filter(User.address=="admin@duramail").first()
         if not u:
-            pw=os.getenv("DURA_ADMIN_PASSWORD","Dura-Admin-ChangeMe-2026!")
-            u=User(address="admin@duramail",display_name="DuraIndustry",channel_name="DuraTube",password_hash=ph.hash(pw),is_admin=True,is_official=True);d.add(u);d.commit();d.refresh(u)
-        else:u.is_admin=True;u.is_official=True;u.channel_name=u.channel_name or "DuraTube";d.commit()
-        if not d.query(ChannelProfile).filter_by(user_id=u.id).first():d.add(ChannelProfile(user_id=u.id,description="Chaîne officielle Dura."));d.commit()
-    finally:d.close()
+            pw=os.getenv("DURA_ADMIN_PASSWORD","").strip()
+            if not pw:
+                pw=secrets.token_urlsafe(18)
+                CONFIG_WARNINGS.append("DURA_ADMIN_PASSWORD absent lors de la création initiale de l'admin. Un mot de passe aléatoire a été généré et écrit dans les logs Render.")
+                logger.warning("MOT DE PASSE ADMIN INITIAL (à changer immédiatement): %s",pw)
+            u=User(address="admin@duramail",display_name="DuraIndustry",channel_name="DuraTube",password_hash=ph.hash(pw),is_admin=True,is_official=True)
+            d.add(u);d.commit();d.refresh(u)
+        else:
+            u.is_admin=True;u.is_official=True;u.channel_name=u.channel_name or "DuraTube";d.commit()
+        if not d.query(ChannelProfile).filter_by(user_id=u.id).first():
+            d.add(ChannelProfile(user_id=u.id,description="Chaîne officielle Dura."));d.commit()
+    except Exception as exc:
+        d.rollback()
+        CONFIG_WARNINGS.append(f"Initialisation admin incomplète: {type(exc).__name__}: {exc}")
+        logger.exception("Erreur bootstrap admin")
+    finally:
+        d.close()
+    for warning in CONFIG_WARNINGS:
+        logger.warning("CONFIG: %s",warning)
 
 @app.get("/")
-def status():return {"service":"Dura Cloud","version":"4.0","status":"online","release":"publish-candidate","duratube":True,"studio":True,"duramail":True,"duraia":"DuraBrain Local","r2":bool(R2_ENDPOINT)}
+def status():
+    return {"service":"Dura Cloud","version":"4.1","status":"online" if DATABASE_READY else "degraded",
+            "release":"publish-candidate-2","duratube":True,"studio":True,"duramail":True,
+            "duraia":"DuraBrain Local 1.1","database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
+            "warnings":CONFIG_WARNINGS}
+
 @app.get("/health")
-def health(d:Session=Depends(db)):
-    db_ok=True
-    try:d.execute(__import__("sqlalchemy").text("SELECT 1"))
-    except Exception:db_ok=False
-    return {"ok":db_ok,"database":db_ok,"r2_configured":bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET),"version":"4.0"}
+def health():
+    db_ok=False
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        db_ok=True
+    except Exception:
+        db_ok=False
+    r2_cfg=bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET)
+    secret_persistent=bool(os.getenv("DURA_SECRET","").strip())
+    return {"ok":db_ok,"database":db_ok,"r2_configured":r2_cfg,"secret_persistent":secret_persistent,
+            "warnings":CONFIG_WARNINGS,"version":"4.1"}
+
+@app.get("/ready")
+def ready():
+    if not DATABASE_READY:
+        raise HTTPException(503,"Dura Cloud démarre mais la base de données n'est pas prête. Consulte /health et les logs Render.")
+    return {"ready":True,"version":"4.1"}
 
 @app.patch("/account/profile")
 def update_profile(x:ProfileIn,u:User=Depends(me),d:Session=Depends(db)):
@@ -282,16 +355,37 @@ def delete_mail(mid:int,u:User=Depends(me),d:Session=Depends(db)):
 
 @app.post("/mail/send")
 async def send_mail_with_attachment(to:str=Form(...),subject:str=Form(""),body:str=Form(""),attachment:UploadFile|None=File(None),u:User=Depends(me),d:Session=Depends(db)):
-    r=d.query(User).filter(User.address==clean_address(to)).first()
-    if not r:raise HTTPException(404,"Adresse DuraMail inexistante.")
-    m=Mail(sender_id=u.id,recipient_id=r.id,subject=subject[:180],body=body[:100000]);d.add(m);d.commit();d.refresh(m)
+    recipient=d.query(User).filter(User.address==clean_address(to)).first()
+    if not recipient:raise HTTPException(404,"Adresse DuraMail inexistante.")
+    reject_oversize(attachment,MAX_MAIL_ATTACHMENT_MB,"Pièce jointe")
+    object_key=None
+    attachment_size=0
     if attachment and attachment.filename:
-        raw=attachment.file.read();attachment.file.seek(0)
-        if len(raw)>25*1024*1024:raise HTTPException(413,"Pièce jointe limitée à 25 Mo.")
-        ext=Path(attachment.filename).suffix.lower();key=f"mail/{u.id}/{m.id}/{uuid.uuid4().hex}{ext}"
-        r2().upload_fileobj(attachment.file,R2_BUCKET,key,ExtraArgs={"ContentType":attachment.content_type or "application/octet-stream"})
-        d.add(MailAttachment(mail_id=m.id,object_key=key,filename=attachment.filename[:255],content_type=attachment.content_type or "application/octet-stream",size=len(raw)));d.commit()
-    return {"ok":True,"id":m.id}
+        if getattr(attachment,"size",None) is None:
+            raw=attachment.file.read(MAX_MAIL_ATTACHMENT_MB*1024*1024+1);attachment.file.seek(0)
+            if len(raw)>MAX_MAIL_ATTACHMENT_MB*1024*1024:raise HTTPException(413,f"Pièce jointe limitée à {MAX_MAIL_ATTACHMENT_MB} Mo.")
+            attachment_size=len(raw)
+        else:
+            attachment_size=int(attachment.size)
+        ext=Path(attachment.filename).suffix.lower()
+        object_key=f"mail/{u.id}/{uuid.uuid4().hex}{ext}"
+        try:
+            r2().upload_fileobj(attachment.file,R2_BUCKET,object_key,ExtraArgs={"ContentType":attachment.content_type or "application/octet-stream"})
+        except Exception as exc:
+            logger.exception("Upload pièce jointe impossible")
+            raise HTTPException(503,"Le stockage des pièces jointes est temporairement indisponible.") from exc
+    try:
+        m=Mail(sender_id=u.id,recipient_id=recipient.id,subject=subject[:180],body=body[:100000]);d.add(m);d.flush()
+        if object_key:
+            d.add(MailAttachment(mail_id=m.id,object_key=object_key,filename=attachment.filename[:255],content_type=attachment.content_type or "application/octet-stream",size=attachment_size))
+        d.commit();d.refresh(m)
+        return {"ok":True,"id":m.id}
+    except Exception:
+        d.rollback()
+        if object_key:
+            try:r2().delete_object(Bucket=R2_BUCKET,Key=object_key)
+            except Exception:pass
+        raise
 
 @app.get("/mail/{mid}/attachments")
 def mail_attachments(mid:int,u:User=Depends(me),d:Session=Depends(db)):
@@ -314,9 +408,13 @@ def unread_count(u:User=Depends(me),d:Session=Depends(db)):
 @app.post("/videos/upload")
 async def upload_video(title:str=Form(...),description:str=Form(""),is_short:bool=Form(False),file:UploadFile=File(...),thumbnail:UploadFile|None=File(None),u:User=Depends(me),d:Session=Depends(db)):
     if not u.channel_name:raise HTTPException(403,"Crée une chaîne avant de publier.")
+    reject_oversize(file,MAX_VIDEO_MB,"Vidéo");reject_oversize(thumbnail,20,"Miniature")
     ext=Path(file.filename or "").suffix.lower()
     if ext not in {".mp4",".mov",".mkv",".avi",".webm",".m4v"}:raise HTTPException(400,"Format vidéo non accepté.")
-    key=f"videos/{u.id}/{uuid.uuid4().hex}{ext}";r2().upload_fileobj(file.file,R2_BUCKET,key,ExtraArgs={"ContentType":file.content_type or "video/mp4"})
+    key=f"videos/{u.id}/{uuid.uuid4().hex}{ext}"
+    try:r2().upload_fileobj(file.file,R2_BUCKET,key,ExtraArgs={"ContentType":file.content_type or "video/mp4"})
+    except Exception as exc:
+        logger.exception("Upload vidéo R2 impossible");raise HTTPException(503,"Stockage vidéo temporairement indisponible.") from exc
     tk=None
     if thumbnail and thumbnail.filename:
         te=Path(thumbnail.filename).suffix.lower()
@@ -486,6 +584,7 @@ def posts(d:Session=Depends(db)):
 async def create_post(content:str=Form(""),media:UploadFile|None=File(None),u:User=Depends(me),d:Session=Depends(db)):
     key=None;typ="none"
     if media and media.filename:
+        reject_oversize(media,MAX_POST_MEDIA_MB,"Média")
         ext=Path(media.filename).suffix.lower();typ="image" if ext in {".jpg",".jpeg",".png",".webp",".gif"} else "video" if ext in {".mp4",".mov",".webm",".mkv"} else ""
         if not typ:raise HTTPException(400,"Média non accepté.")
         key=f"posts/{u.id}/{uuid.uuid4().hex}{ext}";r2().upload_fileobj(media.file,R2_BUCKET,key,ExtraArgs={"ContentType":media.content_type or "application/octet-stream"})
@@ -585,7 +684,7 @@ def ai_memories(user_id,d):return {m.key:m.value for m in d.query(AiMemory).filt
 
 @app.get("/ai/status")
 def ai_status(u:User=Depends(me),d:Session=Depends(db)):
-    a=d.query(AiAccess).filter_by(user_id=u.id).first();return {"verified":bool(a and a.verified),"engine":"DuraBrain Local 1.0","provider_ready":True,"external_api":False}
+    a=d.query(AiAccess).filter_by(user_id=u.id).first();return {"verified":bool(a and a.verified),"engine":"DuraBrain Local 1.1","provider_ready":True,"external_api":False}
 
 @app.post("/ai/request-code")
 def ai_request_code(u:User=Depends(me),d:Session=Depends(db)):
@@ -649,4 +748,4 @@ def ai_chat(x:AiChat,u:User=Depends(me),d:Session=Depends(db)):
         else:answer="Utilise par exemple : retiens que projet = DuraTube."
     else:answer=BRAIN.answer(x.message,ai_memories(u.id,d))
     d.add(AiMessage(conversation_id=c.id,role="user",content=x.message));d.add(AiMessage(conversation_id=c.id,role="assistant",content=answer));c.updated_at=datetime.utcnow();d.commit()
-    return {"text":answer,"conversation_id":c.id,"engine":"DuraBrain Local 1.0"}
+    return {"text":answer,"conversation_id":c.id,"engine":"DuraBrain Local 1.1"}
