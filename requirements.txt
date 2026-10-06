@@ -5,3 +5,4 @@ pydantic
 argon2-cffi
 PyJWT
 python-multipart
+psycopg[binary]
