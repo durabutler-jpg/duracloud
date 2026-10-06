@@ -1,4 +1,5 @@
-import os, uuid, jwt, boto3, random, hashlib
+import os, uuid, jwt, boto3, random, hashlib, ast, math, re, html
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -16,8 +17,6 @@ R2_ENDPOINT=os.getenv("R2_ENDPOINT","")
 R2_ACCESS_KEY_ID=os.getenv("R2_ACCESS_KEY_ID","")
 R2_SECRET_ACCESS_KEY=os.getenv("R2_SECRET_ACCESS_KEY","")
 R2_BUCKET=os.getenv("R2_BUCKET_NAME","duratube-media")
-OPENAI_API_KEY=os.getenv("DURAIA_OPENAI_API_KEY","")
-OPENAI_MODEL=os.getenv("DURAIA_MODEL","gpt-6-astra")
 
 engine=create_engine(DB_URL,connect_args={"check_same_thread":False} if DB_URL.startswith("sqlite") else {},pool_pre_ping=True)
 SessionLocal=sessionmaker(bind=engine,autoflush=False,autocommit=False)
@@ -80,9 +79,24 @@ class AiAccess(Base):
 class AiCode(Base):
     __tablename__="ai_codes"
     id=Column(Integer,primary_key=True); user_id=Column(Integer,ForeignKey("users.id"),nullable=False,index=True); code_hash=Column(String(64),nullable=False); expires_at=Column(DateTime,nullable=False); used=Column(Boolean,default=False)
+class AiConversation(Base):
+    __tablename__="ai_conversations"
+    id=Column(Integer,primary_key=True); user_id=Column(Integer,ForeignKey("users.id"),nullable=False,index=True); title=Column(String(120),default="Nouvelle conversation"); created_at=Column(DateTime,default=datetime.utcnow); updated_at=Column(DateTime,default=datetime.utcnow)
+class AiMessage(Base):
+    __tablename__="ai_messages"
+    id=Column(Integer,primary_key=True); conversation_id=Column(Integer,ForeignKey("ai_conversations.id"),nullable=False,index=True); role=Column(String(20),nullable=False); content=Column(Text,nullable=False); created_at=Column(DateTime,default=datetime.utcnow)
+class AiMemory(Base):
+    __tablename__="ai_memories"; __table_args__=(UniqueConstraint("user_id","key",name="uq_ai_memory"),)
+    id=Column(Integer,primary_key=True); user_id=Column(Integer,ForeignKey("users.id"),nullable=False,index=True); key=Column(String(80),nullable=False); value=Column(Text,nullable=False); updated_at=Column(DateTime,default=datetime.utcnow)
+class MailAttachment(Base):
+    __tablename__="mail_attachments"
+    id=Column(Integer,primary_key=True); mail_id=Column(Integer,ForeignKey("mail.id"),nullable=False,index=True); object_key=Column(String(500),nullable=False); filename=Column(String(255),nullable=False); content_type=Column(String(120),default="application/octet-stream"); size=Column(Integer,default=0)
+class Report(Base):
+    __tablename__="reports"
+    id=Column(Integer,primary_key=True); reporter_id=Column(Integer,ForeignKey("users.id"),nullable=False); target_type=Column(String(30),nullable=False); target_id=Column(Integer,nullable=False); reason=Column(String(300),default=""); status=Column(String(30),default="open"); created_at=Column(DateTime,default=datetime.utcnow)
 
 Base.metadata.create_all(engine)
-app=FastAPI(title="Dura Cloud",version="3.0")
+app=FastAPI(title="Dura Cloud",version="4.0")
 
 def db():
     d=SessionLocal()
@@ -116,10 +130,19 @@ class ThemeIn(BaseModel):accent:str="#ff3158";background:str="#0f0f10";surface:s
 class ChannelIn(BaseModel):name:str=Field(min_length=2,max_length=80);description:str=""
 class VideoEdit(BaseModel):title:Optional[str]=None;description:Optional[str]=None;status:Optional[str]=None
 class AiVerify(BaseModel):code:str
-class AiChat(BaseModel):message:str=Field(min_length=1,max_length=12000);history:list[dict]=[]
+class AiChat(BaseModel):
+    message:str=Field(min_length=1,max_length=12000)
+    conversation_id:Optional[int]=None
+class AiConversationIn(BaseModel):title:str="Nouvelle conversation"
+class AiMemoryIn(BaseModel):key:str=Field(min_length=1,max_length=80);value:str=Field(min_length=1,max_length=4000)
+class ProfileIn(BaseModel):display_name:str=Field(min_length=2,max_length=80)
+class PasswordIn(BaseModel):current_password:str;new_password:str=Field(min_length=8,max_length=128)
+class ReportIn(BaseModel):target_type:str;target_id:int;reason:str=""
 
 @app.on_event("startup")
 def bootstrap():
+    if SECRET=="CHANGE-ME" or len(SECRET)<32:
+        raise RuntimeError("DURA_SECRET doit contenir au moins 32 caractères en production.")
     d=SessionLocal()
     try:
         u=d.query(User).filter(User.address=="admin@duramail").first()
@@ -131,7 +154,25 @@ def bootstrap():
     finally:d.close()
 
 @app.get("/")
-def status():return {"service":"Dura Cloud","version":"3.0","status":"online","duratube":True,"studio":True,"duramail":True,"duraia":True}
+def status():return {"service":"Dura Cloud","version":"4.0","status":"online","release":"publish-candidate","duratube":True,"studio":True,"duramail":True,"duraia":"DuraBrain Local","r2":bool(R2_ENDPOINT)}
+@app.get("/health")
+def health(d:Session=Depends(db)):
+    db_ok=True
+    try:d.execute(__import__("sqlalchemy").text("SELECT 1"))
+    except Exception:db_ok=False
+    return {"ok":db_ok,"database":db_ok,"r2_configured":bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET),"version":"4.0"}
+
+@app.patch("/account/profile")
+def update_profile(x:ProfileIn,u:User=Depends(me),d:Session=Depends(db)):
+    u.display_name=x.display_name.strip();d.commit();return pub_user(u)
+
+@app.post("/auth/change-password")
+def change_password(x:PasswordIn,u:User=Depends(me),d:Session=Depends(db)):
+    try:ok=ph.verify(u.password_hash,x.current_password)
+    except VerifyMismatchError:ok=False
+    if not ok:raise HTTPException(400,"Mot de passe actuel incorrect.")
+    u.password_hash=ph.hash(x.new_password);d.commit();return {"ok":True}
+
 @app.post("/auth/register")
 def register(x:Register,d:Session=Depends(db)):
     a=clean_address(x.address)
@@ -239,6 +280,37 @@ def delete_mail(mid:int,u:User=Depends(me),d:Session=Depends(db)):
     if m.recipient_id==u.id:m.trash_recipient=True
     d.commit();return {"ok":True}
 
+@app.post("/mail/send")
+async def send_mail_with_attachment(to:str=Form(...),subject:str=Form(""),body:str=Form(""),attachment:UploadFile|None=File(None),u:User=Depends(me),d:Session=Depends(db)):
+    r=d.query(User).filter(User.address==clean_address(to)).first()
+    if not r:raise HTTPException(404,"Adresse DuraMail inexistante.")
+    m=Mail(sender_id=u.id,recipient_id=r.id,subject=subject[:180],body=body[:100000]);d.add(m);d.commit();d.refresh(m)
+    if attachment and attachment.filename:
+        raw=attachment.file.read();attachment.file.seek(0)
+        if len(raw)>25*1024*1024:raise HTTPException(413,"Pièce jointe limitée à 25 Mo.")
+        ext=Path(attachment.filename).suffix.lower();key=f"mail/{u.id}/{m.id}/{uuid.uuid4().hex}{ext}"
+        r2().upload_fileobj(attachment.file,R2_BUCKET,key,ExtraArgs={"ContentType":attachment.content_type or "application/octet-stream"})
+        d.add(MailAttachment(mail_id=m.id,object_key=key,filename=attachment.filename[:255],content_type=attachment.content_type or "application/octet-stream",size=len(raw)));d.commit()
+    return {"ok":True,"id":m.id}
+
+@app.get("/mail/{mid}/attachments")
+def mail_attachments(mid:int,u:User=Depends(me),d:Session=Depends(db)):
+    m=d.get(Mail,mid)
+    if not m or u.id not in (m.sender_id,m.recipient_id):raise HTTPException(404)
+    return [{"id":a.id,"filename":a.filename,"content_type":a.content_type,"size":a.size,"url":f"/mail/attachment/{a.id}"} for a in d.query(MailAttachment).filter_by(mail_id=mid).all()]
+
+@app.get("/mail/attachment/{aid}")
+def mail_attachment(aid:int,u:User=Depends(me),d:Session=Depends(db)):
+    a=d.get(MailAttachment,aid)
+    if not a:raise HTTPException(404)
+    m=d.get(Mail,a.mail_id)
+    if not m or u.id not in (m.sender_id,m.recipient_id):raise HTTPException(403)
+    return RedirectResponse(signed(a.object_key))
+
+@app.get("/mail/unread-count")
+def unread_count(u:User=Depends(me),d:Session=Depends(db)):
+    return {"count":d.query(Mail).filter(Mail.recipient_id==u.id,Mail.is_read==False,Mail.trash_recipient==False).count()}
+
 @app.post("/videos/upload")
 async def upload_video(title:str=Form(...),description:str=Form(""),is_short:bool=Form(False),file:UploadFile=File(...),thumbnail:UploadFile|None=File(None),u:User=Depends(me),d:Session=Depends(db)):
     if not u.channel_name:raise HTTPException(403,"Crée une chaîne avant de publier.")
@@ -334,6 +406,18 @@ def unsubscribe(channel_id:int,u:User=Depends(me),d:Session=Depends(db)):
     s=d.query(Subscription).filter_by(subscriber_id=u.id,channel_id=channel_id).first()
     if s:d.delete(s);d.commit()
     return {"subscribed":False}
+@app.get("/subscriptions/status/{channel_id}")
+def subscription_status(channel_id:int,u:User=Depends(me),d:Session=Depends(db)):
+    return {"subscribed":d.query(Subscription).filter_by(subscriber_id=u.id,channel_id=channel_id).first() is not None,"subscribers":d.query(Subscription).filter_by(channel_id=channel_id).count()}
+
+@app.get("/subscriptions/me")
+def my_subscriptions(u:User=Depends(me),d:Session=Depends(db)):
+    rows=d.query(Subscription).filter_by(subscriber_id=u.id).all();out=[]
+    for row in rows:
+        ch=d.get(User,row.channel_id)
+        if ch:out.append(pub_user(ch)|{"subscribers":d.query(Subscription).filter_by(channel_id=ch.id).count(),"videos":d.query(Video).filter_by(owner_id=ch.id,status="published").count()})
+    return out
+
 @app.get("/studio/dashboard")
 def studio_dashboard(u:User=Depends(me),d:Session=Depends(db)):
     if not u.channel_name:raise HTTPException(403,"Aucune chaîne.")
@@ -343,6 +427,54 @@ def studio_dashboard(u:User=Depends(me),d:Session=Depends(db)):
 def studio_content(u:User=Depends(me),d:Session=Depends(db)):
     if not u.channel_name:raise HTTPException(403,"Aucune chaîne.")
     return [pub_video(v)|{"status":v.status} for v in d.query(Video).filter_by(owner_id=u.id).order_by(Video.id.desc()).all()]
+
+@app.get("/studio/analytics")
+def studio_analytics(u:User=Depends(me),d:Session=Depends(db)):
+    if not u.channel_name:raise HTTPException(403,"Aucune chaîne.")
+    vids=d.query(Video).filter_by(owner_id=u.id).all();total_views=sum(v.views or 0 for v in vids);total_likes=sum(v.likes or 0 for v in vids)
+    top=sorted(vids,key=lambda v:(v.views or 0,v.likes or 0),reverse=True)[:5]
+    return {"subscribers":d.query(Subscription).filter_by(channel_id=u.id).count(),"videos":len(vids),"views":total_views,"likes":total_likes,"engagement":round((total_likes/max(total_views,1))*100,2),"top":[pub_video(v) for v in top]}
+
+@app.post("/reports")
+def create_report(x:ReportIn,u:User=Depends(me),d:Session=Depends(db)):
+    if x.target_type not in {"video","post","comment","channel"}:raise HTTPException(400,"Type de signalement invalide.")
+    r=Report(reporter_id=u.id,target_type=x.target_type,target_id=x.target_id,reason=x.reason[:300]);d.add(r);d.commit();return {"ok":True,"id":r.id}
+
+@app.get("/admin/stats")
+def admin_stats(u:User=Depends(me),d:Session=Depends(db)):
+    if not u.is_admin:raise HTTPException(403)
+    return {"users":d.query(User).count(),"videos":d.query(Video).count(),"posts":d.query(Post).count(),"mails":d.query(Mail).count(),"reports_open":d.query(Report).filter_by(status="open").count()}
+
+@app.get("/admin/reports")
+def admin_reports(u:User=Depends(me),d:Session=Depends(db)):
+    if not u.is_admin:raise HTTPException(403)
+    return [{"id":r.id,"target_type":r.target_type,"target_id":r.target_id,"reason":r.reason,"status":r.status,"created_at":r.created_at.isoformat()} for r in d.query(Report).order_by(Report.id.desc()).limit(200).all()]
+
+@app.get("/admin/users")
+def admin_users(u:User=Depends(me),d:Session=Depends(db)):
+    if not u.is_admin:raise HTTPException(403)
+    return [pub_user(x)|{"banned":bool(x.is_banned),"created_at":x.created_at.isoformat() if x.created_at else ""} for x in d.query(User).order_by(User.id.desc()).limit(500).all()]
+
+@app.post("/admin/users/{uid}/ban")
+def admin_ban(uid:int,u:User=Depends(me),d:Session=Depends(db)):
+    if not u.is_admin:raise HTTPException(403)
+    x=d.get(User,uid)
+    if not x or x.is_official:raise HTTPException(400,"Action impossible.")
+    x.is_banned=not x.is_banned;d.commit();return {"banned":x.is_banned}
+
+@app.post("/admin/reports/{rid}/resolve")
+def admin_resolve_report(rid:int,u:User=Depends(me),d:Session=Depends(db)):
+    if not u.is_admin:raise HTTPException(403)
+    r=d.get(Report,rid)
+    if not r:raise HTTPException(404)
+    r.status="resolved";d.commit();return {"ok":True}
+
+@app.post("/admin/videos/{vid}/hide")
+def admin_hide_video(vid:int,u:User=Depends(me),d:Session=Depends(db)):
+    if not u.is_admin:raise HTTPException(403)
+    v=d.get(Video,vid)
+    if not v:raise HTTPException(404)
+    v.status="private" if v.status=="published" else "published";d.commit();return {"status":v.status}
 
 @app.get("/posts")
 def posts(d:Session=Depends(db)):
@@ -373,30 +505,148 @@ def post_like(pid:int,u:User=Depends(me),d:Session=Depends(db)):
     else:d.add(PostLike(post_id=pid,user_id=u.id));p.likes=(p.likes or 0)+1;liked=True
     d.commit();return {"liked":liked,"likes":p.likes}
 
+# ---------------- DURAIA / DURABRAIN LOCAL ----------------
+STOPWORDS={"le","la","les","un","une","des","de","du","et","ou","a","à","au","aux","en","dans","pour","par","sur","avec","sans","ce","cette","ces","je","tu","il","elle","on","nous","vous","ils","elles","que","qui","quoi","est","sont","être","avoir","fait","faire","plus","pas","ne","mon","ma","mes","ton","ta","tes","son","sa","ses"}
+
+class DuraBrain:
+    def tokenize(self,text):return re.findall(r"[a-zA-ZÀ-ÿ0-9']+",text.lower())
+    def sentences(self,text):return [x.strip() for x in re.split(r"(?<=[.!?])\s+|\n+",text.strip()) if x.strip()]
+    def safe_math(self,expr):
+        allowed={ast.Add:lambda a,b:a+b,ast.Sub:lambda a,b:a-b,ast.Mult:lambda a,b:a*b,ast.Div:lambda a,b:a/b,ast.FloorDiv:lambda a,b:a//b,ast.Mod:lambda a,b:a%b,ast.Pow:lambda a,b:a**b,ast.USub:lambda a:-a,ast.UAdd:lambda a:+a}
+        def ev(n):
+            if isinstance(n,ast.Expression):return ev(n.body)
+            if isinstance(n,ast.Constant) and isinstance(n.value,(int,float)):return n.value
+            if isinstance(n,ast.BinOp) and type(n.op) in allowed:
+                a,b=ev(n.left),ev(n.right)
+                if isinstance(n.op,ast.Pow) and abs(b)>10:raise ValueError()
+                return allowed[type(n.op)](a,b)
+            if isinstance(n,ast.UnaryOp) and type(n.op) in allowed:return allowed[type(n.op)](ev(n.operand))
+            raise ValueError()
+        tree=ast.parse(expr,mode="eval");return ev(tree)
+    def summarize(self,text,limit=4):
+        sents=self.sentences(text)
+        if len(sents)<=limit:return "\n".join(sents)
+        words=[w for w in self.tokenize(text) if w not in STOPWORDS and len(w)>2];freq=Counter(words)
+        scored=[]
+        for i,s in enumerate(sents):
+            toks=[w for w in self.tokenize(s) if w not in STOPWORDS];score=sum(freq[w] for w in toks)/(len(toks)+1);scored.append((score,i,s))
+        chosen=sorted(sorted(scored,reverse=True)[:limit],key=lambda x:x[1]);return " ".join(x[2] for x in chosen)
+    def rewrite(self,text):
+        t=text.strip();t=re.sub(r"\s+"," ",t);t=re.sub(r"\s+([,.!?;:])",r"\1",t)
+        if t:t=t[0].upper()+t[1:]
+        if t and t[-1] not in ".!?":t+="."
+        return t
+    def brainstorm(self,topic):
+        topic=topic.strip() or "ton projet"
+        frames=["Version simple et rapide","Version premium","Angle communauté","Angle viral","Angle utile au quotidien","Angle automatisation","Angle personnalisation","Angle collaboration"]
+        return "\n".join(f"{i+1}. {f} autour de {topic}." for i,f in enumerate(frames))
+    def plan(self,goal):
+        return f"Objectif : {goal.strip()}\n\n1. Définir le résultat exact.\n2. Faire une version minimale testable.\n3. Tester avec un vrai utilisateur.\n4. Corriger les blocages.\n5. Ajouter les fonctions importantes.\n6. Vérifier sécurité, erreurs et sauvegardes.\n7. Préparer la publication et une checklist de lancement."
+    def answer(self,message,memories):
+        raw=message.strip();low=raw.lower();tokens=set(self.tokenize(raw))
+        if low.startswith(("calcule ","calcul ")):
+            expr=raw.split(" ",1)[1].replace("×","*").replace("÷","/").replace("^","**")
+            try:return f"Résultat : {self.safe_math(expr)}"
+            except Exception:return "Je n'arrive pas à interpréter ce calcul. Utilise par exemple : calcule (12+8)*3."
+        if re.fullmatch(r"[0-9\s+\-*/().,%^]+",raw):
+            try:return f"Résultat : {self.safe_math(raw.replace('^','**'))}"
+            except Exception:pass
+        if low.startswith(("résume ","resume ","résumer ","resumer ")):
+            text=raw.split(" ",1)[1] if " " in raw else "";return "Résumé :\n"+self.summarize(text)
+        if low.startswith(("réécris ","reecris ","corrige ","reformule ")):
+            text=raw.split(" ",1)[1] if " " in raw else "";return self.rewrite(text)
+        if low.startswith(("idées ","idees ","brainstorm ")):
+            return self.brainstorm(raw.split(" ",1)[1] if " " in raw else "")
+        if low.startswith(("plan ","planifie ","organise ")):
+            return self.plan(raw.split(" ",1)[1] if " " in raw else raw)
+        if "duratube" in tokens:
+            return "DuraTube est la plateforme vidéo de l'écosystème Dura. Le compte est un compte Dura @duramail, les médias sont stockés sur R2 et DuraTube Studio sert à gérer une chaîne."
+        if "duramail" in tokens:
+            return "DuraMail est la messagerie interne de l'écosystème Dura. Les messages passent par Dura Cloud et peuvent contenir une pièce jointe."
+        if "studio" in tokens and "dura" in low:
+            return "DuraTube Studio sert à gérer ta chaîne : vidéos, statistiques, personnalisation et communauté."
+        if any(x in low for x in ["qui suis-je","que sais-tu sur moi","tu sais quoi sur moi"]):
+            if not memories:return "Je n'ai encore rien mémorisé à ton sujet dans DuraIA."
+            return "Voici ce que j'ai en mémoire :\n"+"\n".join(f"• {k} : {v}" for k,v in memories.items())
+        if low in {"bonjour","salut","hello","hey","wesh"}:return "Salut. Je suis DuraIA, le moteur IA maison de l'écosystème Dura. Je peux calculer, résumer, reformuler, brainstormer, planifier et t'aider sur les apps Dura."
+        if "merci" in tokens:return "Avec plaisir."
+        # Lightweight keyword synthesis, no external provider.
+        important=[w for w in self.tokenize(raw) if w not in STOPWORDS and len(w)>2][:8]
+        subject=" ".join(important[:4]) or "ta demande"
+        return f"Je comprends que ta demande concerne {subject}. Mon moteur local n'est pas un grand modèle de langage externe : je peux surtout structurer le problème.\n\n{self.plan(raw)}"
+
+BRAIN=DuraBrain()
+
+def ai_verified(u,d):
+    a=d.query(AiAccess).filter_by(user_id=u.id).first()
+    if not a or not a.verified:raise HTTPException(403,"Vérifie d'abord ton accès DuraIA.")
+
+def ai_memories(user_id,d):return {m.key:m.value for m in d.query(AiMemory).filter_by(user_id=user_id).all()}
+
 @app.get("/ai/status")
 def ai_status(u:User=Depends(me),d:Session=Depends(db)):
-    a=d.query(AiAccess).filter_by(user_id=u.id).first();return {"verified":bool(a and a.verified),"provider_ready":bool(OPENAI_API_KEY)}
+    a=d.query(AiAccess).filter_by(user_id=u.id).first();return {"verified":bool(a and a.verified),"engine":"DuraBrain Local 1.0","provider_ready":True,"external_api":False}
+
 @app.post("/ai/request-code")
 def ai_request_code(u:User=Depends(me),d:Session=Depends(db)):
     code=f"{random.randint(0,999999):06d}";h=hashlib.sha256(code.encode()).hexdigest();d.add(AiCode(user_id=u.id,code_hash=h,expires_at=datetime.utcnow()+timedelta(minutes=10)))
     admin=d.query(User).filter(User.is_official==True).first()
     if not admin:raise HTTPException(500,"Compte système absent.")
-    d.add(Mail(sender_id=admin.id,recipient_id=u.id,subject="Code d’accès DuraIA",body=f"Ton code DuraIA est : {code}\nIl expire dans 10 minutes."));d.commit();return {"ok":True,"message":"Code envoyé dans DuraMail."}
+    d.add(Mail(sender_id=admin.id,recipient_id=u.id,subject="Code d'accès DuraIA",body=f"Ton code DuraIA est : {code}\nIl expire dans 10 minutes."));d.commit();return {"ok":True,"message":"Code envoyé dans DuraMail."}
+
 @app.post("/ai/verify")
 def ai_verify(x:AiVerify,u:User=Depends(me),d:Session=Depends(db)):
     h=hashlib.sha256(x.code.strip().encode()).hexdigest();row=d.query(AiCode).filter_by(user_id=u.id,used=False).order_by(AiCode.id.desc()).first()
     if not row or row.expires_at<datetime.utcnow() or row.code_hash!=h:raise HTTPException(400,"Code invalide ou expiré.")
     row.used=True;a=d.query(AiAccess).filter_by(user_id=u.id).first() or AiAccess(user_id=u.id);a.verified=True;a.verified_at=datetime.utcnow();d.add(a);d.commit();return {"verified":True}
+
+@app.get("/ai/conversations")
+def ai_conversations(u:User=Depends(me),d:Session=Depends(db)):
+    ai_verified(u,d);rows=d.query(AiConversation).filter_by(user_id=u.id).order_by(AiConversation.updated_at.desc()).limit(100).all();return [{"id":c.id,"title":c.title,"updated_at":c.updated_at.isoformat()} for c in rows]
+
+@app.post("/ai/conversations")
+def ai_new_conversation(x:AiConversationIn,u:User=Depends(me),d:Session=Depends(db)):
+    ai_verified(u,d);c=AiConversation(user_id=u.id,title=(x.title.strip() or "Nouvelle conversation")[:120]);d.add(c);d.commit();d.refresh(c);return {"id":c.id,"title":c.title}
+
+@app.get("/ai/conversations/{cid}")
+def ai_conversation(cid:int,u:User=Depends(me),d:Session=Depends(db)):
+    ai_verified(u,d);c=d.get(AiConversation,cid)
+    if not c or c.user_id!=u.id:raise HTTPException(404)
+    return {"id":c.id,"title":c.title,"messages":[{"role":m.role,"content":m.content,"created_at":m.created_at.isoformat()} for m in d.query(AiMessage).filter_by(conversation_id=cid).order_by(AiMessage.id).all()]}
+
+@app.delete("/ai/conversations/{cid}")
+def ai_delete_conversation(cid:int,u:User=Depends(me),d:Session=Depends(db)):
+    ai_verified(u,d);c=d.get(AiConversation,cid)
+    if not c or c.user_id!=u.id:raise HTTPException(404)
+    d.query(AiMessage).filter_by(conversation_id=cid).delete();d.delete(c);d.commit();return {"ok":True}
+
+@app.get("/ai/memory")
+def ai_memory(u:User=Depends(me),d:Session=Depends(db)):
+    ai_verified(u,d);return ai_memories(u.id,d)
+
+@app.put("/ai/memory")
+def ai_memory_put(x:AiMemoryIn,u:User=Depends(me),d:Session=Depends(db)):
+    ai_verified(u,d);row=d.query(AiMemory).filter_by(user_id=u.id,key=x.key.strip()).first()
+    if not row:row=AiMemory(user_id=u.id,key=x.key.strip(),value=x.value.strip());d.add(row)
+    else:row.value=x.value.strip();row.updated_at=datetime.utcnow()
+    d.commit();return {"ok":True}
+
 @app.post("/ai/chat")
 def ai_chat(x:AiChat,u:User=Depends(me),d:Session=Depends(db)):
-    a=d.query(AiAccess).filter_by(user_id=u.id).first()
-    if not a or not a.verified:raise HTTPException(403,"Vérifie d’abord ton accès DuraIA.")
-    if not OPENAI_API_KEY:return {"text":"DuraIA est activée, mais le modèle IA n’est pas encore relié côté serveur. Ajoute DURAIA_OPENAI_API_KEY dans Render."}
-    try:
-        from openai import OpenAI
-        client=OpenAI(api_key=OPENAI_API_KEY)
-        history=(x.history or [])[-20:]
-        inp=[{"role":m.get("role","user"),"content":str(m.get("content",""))[:8000]} for m in history]+[{"role":"user","content":x.message}]
-        response=client.responses.create(model=OPENAI_MODEL,instructions="Tu es DuraIA, assistant généraliste de l’écosystème Dura. Réponds clairement en français par défaut.",input=inp,max_output_tokens=1800)
-        return {"text":response.output_text}
-    except Exception as e:raise HTTPException(502,f"Erreur du fournisseur IA: {type(e).__name__}")
+    ai_verified(u,d);cid=x.conversation_id
+    c=d.get(AiConversation,cid) if cid else None
+    if not c or c.user_id!=u.id:
+        c=AiConversation(user_id=u.id,title=(x.message.strip()[:60] or "Nouvelle conversation"));d.add(c);d.commit();d.refresh(c)
+    # Memory commands: "retiens que clé = valeur"
+    low=x.message.lower().strip()
+    if low.startswith("retiens que "):
+        body=x.message[11:].strip();parts=re.split(r"\s*=\s*|\s+est\s+",body,maxsplit=1)
+        if len(parts)==2:
+            key,value=parts[0].strip()[:80],parts[1].strip()[:4000];row=d.query(AiMemory).filter_by(user_id=u.id,key=key).first()
+            if row:row.value=value;row.updated_at=datetime.utcnow()
+            else:d.add(AiMemory(user_id=u.id,key=key,value=value))
+            answer=f"Je retiens : {key} = {value}."
+        else:answer="Utilise par exemple : retiens que projet = DuraTube."
+    else:answer=BRAIN.answer(x.message,ai_memories(u.id,d))
+    d.add(AiMessage(conversation_id=c.id,role="user",content=x.message));d.add(AiMessage(conversation_id=c.id,role="assistant",content=answer));c.updated_at=datetime.utcnow();d.commit()
+    return {"text":answer,"conversation_id":c.id,"engine":"DuraBrain Local 1.0"}

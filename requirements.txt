@@ -7,4 +7,3 @@ PyJWT
 python-multipart
 psycopg[binary]
 boto3
-openai
