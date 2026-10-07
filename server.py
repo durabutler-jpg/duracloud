@@ -1,4 +1,4 @@
-import os, uuid, jwt, boto3, random, hashlib, ast, math, re, html, secrets, logging
+import os, uuid, jwt, boto3, random, hashlib, ast, math, re, html, secrets, logging, json
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -122,7 +122,7 @@ class Report(Base):
     __tablename__="reports"
     id=Column(Integer,primary_key=True); reporter_id=Column(Integer,ForeignKey("users.id"),nullable=False); target_type=Column(String(30),nullable=False); target_id=Column(Integer,nullable=False); reason=Column(String(300),default=""); status=Column(String(30),default="open"); created_at=Column(DateTime,default=datetime.utcnow)
 
-app=FastAPI(title="Dura Cloud",version="4.4")
+app=FastAPI(title="Dura Cloud",version="4.5")
 app.add_middleware(GZipMiddleware, minimum_size=700)
 
 def db():
@@ -212,9 +212,9 @@ def bootstrap():
 
 @app.get("/")
 def status():
-    return {"service":"Dura Cloud","version":"4.4","status":"online" if DATABASE_READY else "degraded",
-            "release":"ultra-desktop-candidate","duratube":True,"studio":True,"duramail":True,
-            "duraia":"DuraBrain Core 2.0","database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
+    return {"service":"Dura Cloud","version":"4.5","status":"online" if DATABASE_READY else "degraded",
+            "release":"titan-desktop-candidate","duratube":True,"studio":True,"duramail":True,
+            "duraia":"DuraBrain Core 3.5","database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
             "warnings":CONFIG_WARNINGS}
 
 @app.get("/health")
@@ -229,13 +229,13 @@ def health():
     r2_cfg=bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET)
     secret_persistent=bool(os.getenv("DURA_SECRET","").strip())
     return {"ok":db_ok,"database":db_ok,"r2_configured":r2_cfg,"secret_persistent":secret_persistent,
-            "warnings":CONFIG_WARNINGS,"version":"4.4"}
+            "warnings":CONFIG_WARNINGS,"version":"4.5"}
 
 @app.get("/ready")
 def ready():
     if not DATABASE_READY:
         raise HTTPException(503,"Dura Cloud démarre mais la base de données n'est pas prête. Consulte /health et les logs Render.")
-    return {"ready":True,"version":"4.4"}
+    return {"ready":True,"version":"4.5"}
 
 @app.patch("/account/profile")
 def update_profile(x:ProfileIn,u:User=Depends(me),d:Session=Depends(db)):
@@ -252,14 +252,14 @@ def change_password(x:PasswordIn,u:User=Depends(me),d:Session=Depends(db)):
 def register(x:Register,d:Session=Depends(db)):
     a=clean_address(x.address)
     if d.query(User).filter(User.address==a).first():raise HTTPException(409,"Cette adresse @duramail existe déjà.")
-    ch=(x.channel_name or "").strip()
-    if ch and d.query(User).filter(User.channel_name.ilike(ch)).first():raise HTTPException(409,"Ce nom de chaîne existe déjà.")
-    u=User(address=a,display_name=x.display_name.strip(),channel_name=ch,password_hash=ph.hash(x.password));d.add(u);d.commit();d.refresh(u)
-    d.add(ThemeProfile(user_id=u.id));
-    if ch:d.add(ChannelProfile(user_id=u.id))
-    official=d.query(User).filter(User.is_official==True).first()
-    if official and official.id!=u.id:d.add(Subscription(subscriber_id=u.id,channel_id=official.id))
-    d.commit();return {"token":make_token(u),"user":pub_user(u)}
+    # V4.5: une adresse DuraMail ne crée plus une chaîne implicitement.
+    # La chaîne passe obligatoirement par /v45/channel/apply + validation admin.
+    u=User(address=a,display_name=x.display_name.strip(),channel_name="",password_hash=ph.hash(x.password));d.add(u);d.commit();d.refresh(u)
+    d.add(ThemeProfile(user_id=u.id));d.commit()
+    # Même un ancien client est rattaché à la chaîne officielle dès l'inscription.
+    try:v45_ensure_official_subscription(d,u)
+    except Exception:logger.exception("Abonnement officiel automatique incomplet à l'inscription")
+    return {"token":make_token(u),"user":pub_user(u)}
 @app.post("/auth/login")
 def login(x:Login,d:Session=Depends(db)):
     u=d.query(User).filter(User.address==clean_address(x.address)).first()
@@ -268,6 +268,9 @@ def login(x:Login,d:Session=Depends(db)):
     except VerifyMismatchError:ok=False
     if not ok:raise HTTPException(401,"Adresse ou mot de passe incorrect.")
     if u.is_banned:raise HTTPException(403,"Compte suspendu.")
+    # Répare automatiquement l'abonnement système si un ancien compte l'avait perdu.
+    try:v45_ensure_official_subscription(d,u)
+    except Exception:logger.exception("Abonnement officiel automatique incomplet à la connexion")
     return {"token":make_token(u),"user":pub_user(u)}
 @app.get("/auth/me")
 def auth_me(u:User=Depends(me)):return pub_user(u)
@@ -280,7 +283,7 @@ def bootstrap_payload(u:User=Depends(me),d:Session=Depends(db)):
     if u.channel_name:
         p=d.query(ChannelProfile).filter_by(user_id=u.id).first() or ChannelProfile(user_id=u.id)
         channel_data={"name":u.channel_name,"description":p.description or "","subscribers":d.query(Subscription).filter_by(channel_id=u.id).count(),"videos":d.query(Video).filter_by(owner_id=u.id,status="published").count()}
-    return {"user":pub_user(u),"unread":unread,"theme":{k:getattr(t,k) for k in ["accent","background","surface","text","font","radius","density","graphic"]},"channel":channel_data,"version":"4.4"}
+    return {"user":pub_user(u),"unread":unread,"theme":{k:getattr(t,k) for k in ["accent","background","surface","text","font","radius","density","graphic"]},"channel":channel_data,"version":"4.5"}
 
 @app.get("/theme/me")
 def theme_me(u:User=Depends(me),d:Session=Depends(db)):
@@ -295,9 +298,9 @@ def theme_save(x:ThemeIn,u:User=Depends(me),d:Session=Depends(db)):
 
 @app.post("/channel/create")
 def create_channel(x:ChannelIn,u:User=Depends(me),d:Session=Depends(db)):
+    # Compatibilité d'API conservée, mais plus de contournement de la vérification créateur.
     if u.channel_name:raise HTTPException(409,"Tu as déjà une chaîne.")
-    if d.query(User).filter(User.channel_name.ilike(x.name.strip())).first():raise HTTPException(409,"Nom de chaîne déjà utilisé.")
-    u.channel_name=x.name.strip();p=ChannelProfile(user_id=u.id,description=x.description[:2000]);d.add(p);d.commit();return pub_user(u)
+    raise HTTPException(403,"La création directe de chaîne est désactivée. Envoie une vidéo de vérification depuis DuraTube.")
 @app.get("/channel/me")
 def channel_me(u:User=Depends(me),d:Session=Depends(db)):
     if not u.channel_name:raise HTTPException(404,"Aucune chaîne.")
@@ -439,7 +442,7 @@ def videos(q:str="",short:int=-1,owner_id:int=0,d:Session=Depends(db)):
     if q:x=x.filter(Video.title.ilike(f"%{q}%"))
     if short in (0,1):x=x.filter(Video.is_short==bool(short))
     if owner_id:x=x.filter(Video.owner_id==owner_id)
-    rows=x.all();rows.sort(key=lambda v:(bool(v.is_featured),v.id),reverse=True);return [pub_video(v) for v in rows]
+    rows=x.all();rows.sort(key=lambda v:(bool(v.is_featured),v.id),reverse=True);return [v45_video(v,d) for v in rows]
 @app.get("/feed")
 def feed(d:Session=Depends(db)):
     rows=d.query(Video).filter(Video.status=="published",Video.is_short==False).all();active={p.video_id:p for p in d.query(Promotion).filter(Promotion.status=="active").all() if p.delivered_impressions<p.target_impressions}
@@ -447,7 +450,7 @@ def feed(d:Session=Depends(db)):
     for v in rows[:30]:
         p=active.get(v.id)
         if p:p.delivered_impressions+=1;p.status="completed" if p.delivered_impressions>=p.target_impressions else "active"
-    d.commit();return [pub_video(v)|{"promoted":v.id in active} for v in rows[:30]]
+    d.commit();return [v45_video(v,d)|{"promoted":v.id in active} for v in rows[:30]]
 @app.get("/videos/{vid}")
 def video_details(vid:int,d:Session=Depends(db)):
     v=d.get(Video,vid)
@@ -519,7 +522,7 @@ def related_videos(vid:int,d:Session=Depends(db)):
     if not current:raise HTTPException(404)
     rows=d.query(Video).filter(Video.status=="published",Video.is_short==False,Video.id!=vid).all()
     rows.sort(key=lambda v:((v.owner_id==current.owner_id),(v.likes or 0),(v.views or 0),v.id),reverse=True)
-    return [pub_video(v) for v in rows[:12]]
+    return [v45_video(v,d) for v in rows[:12]]
 
 @app.get("/channels")
 def channels(q:str="",d:Session=Depends(db)):
@@ -529,17 +532,25 @@ def channels(q:str="",d:Session=Depends(db)):
 @app.post("/subscriptions/{channel_id}")
 def subscribe(channel_id:int,u:User=Depends(me),d:Session=Depends(db)):
     if channel_id==u.id:raise HTTPException(400)
-    if not d.get(User,channel_id):raise HTTPException(404)
-    if not d.query(Subscription).filter_by(subscriber_id=u.id,channel_id=channel_id).first():d.add(Subscription(subscriber_id=u.id,channel_id=channel_id));d.commit()
-    return {"subscribed":True}
+    ch=d.get(User,channel_id)
+    if not ch:raise HTTPException(404)
+    if not d.query(Subscription).filter_by(subscriber_id=u.id,channel_id=channel_id).first():d.add(Subscription(subscriber_id=u.id,channel_id=channel_id))
+    pref=d.query(SubscriptionSettingV45).filter_by(subscriber_id=u.id,channel_id=channel_id).first()
+    if not pref:d.add(SubscriptionSettingV45(subscriber_id=u.id,channel_id=channel_id,notifications_enabled=True))
+    d.commit();return {"subscribed":True,"mandatory":bool(ch.is_official)}
 @app.delete("/subscriptions/{channel_id}")
 def unsubscribe(channel_id:int,u:User=Depends(me),d:Session=Depends(db)):
+    ch=d.get(User,channel_id)
+    if ch and ch.is_official:raise HTTPException(403,"La chaîne officielle Dura est un abonnement système obligatoire.")
     s=d.query(Subscription).filter_by(subscriber_id=u.id,channel_id=channel_id).first()
-    if s:d.delete(s);d.commit()
+    if s:d.delete(s)
+    d.query(SubscriptionSettingV45).filter_by(subscriber_id=u.id,channel_id=channel_id).delete();d.commit()
     return {"subscribed":False}
 @app.get("/subscriptions/status/{channel_id}")
 def subscription_status(channel_id:int,u:User=Depends(me),d:Session=Depends(db)):
-    return {"subscribed":d.query(Subscription).filter_by(subscriber_id=u.id,channel_id=channel_id).first() is not None,"subscribers":d.query(Subscription).filter_by(channel_id=channel_id).count()}
+    ch=d.get(User,channel_id)
+    if ch and ch.is_official:v45_ensure_official_subscription(d,u)
+    return {"subscribed":d.query(Subscription).filter_by(subscriber_id=u.id,channel_id=channel_id).first() is not None,"subscribers":d.query(Subscription).filter_by(channel_id=channel_id).count(),"mandatory":bool(ch and ch.is_official and ch.id!=u.id)}
 
 @app.get("/subscriptions/me")
 def my_subscriptions(u:User=Depends(me),d:Session=Depends(db)):
@@ -603,6 +614,8 @@ def admin_ban(uid:int,u:User=Depends(me),d:Session=Depends(db)):
     if not u.is_admin:raise HTTPException(403)
     x=d.get(User,uid)
     if not x or x.is_official:raise HTTPException(400,"Action impossible.")
+    if x.is_banned and d.query(PermanentBanV45).filter_by(user_id=uid).first():
+        raise HTTPException(409,"Ce compte porte un bannissement copyright permanent.")
     x.is_banned=not x.is_banned;d.commit();return {"banned":x.is_banned}
 
 @app.post("/admin/reports/{rid}/resolve")
@@ -848,3 +861,765 @@ def ai_chat(x:AiChat,u:User=Depends(me),d:Session=Depends(db)):
         answer=BRAIN.answer(x.message,ai_memories(u.id,d),recent)
     d.add(AiMessage(conversation_id=c.id,role="user",content=x.message));d.add(AiMessage(conversation_id=c.id,role="assistant",content=answer));c.updated_at=datetime.utcnow();d.commit()
     return {"text":answer,"conversation_id":c.id,"engine":"DuraBrain Core 2.0"}
+
+# ============================================================================
+# DURA CLOUD 4.5 TITAN EXTENSIONS
+# Backward compatible with the V4.4 clients while the V4.5 desktop apps use
+# the /v45 namespace for live stats, creator verification, mandatory official
+# subscriptions, admin directory and DuraBrain Core 3.5.
+# ============================================================================
+
+class CreatorVerification(Base):
+    __tablename__ = "creator_verifications"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    channel_name = Column(String(80), nullable=False)
+    description = Column(Text, default="")
+    object_key = Column(String(500), nullable=False)
+    status = Column(String(30), default="pending")
+    review_note = Column(String(500), default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    reviewed_at = Column(DateTime, nullable=True)
+    reviewed_by = Column(Integer, nullable=True)
+
+class SubscriptionSettingV45(Base):
+    __tablename__ = "subscription_settings_v45"
+    __table_args__ = (UniqueConstraint("subscriber_id", "channel_id", name="uq_subscription_setting_v45"),)
+    id = Column(Integer, primary_key=True)
+    subscriber_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    channel_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    notifications_enabled = Column(Boolean, default=True)
+
+class PermanentBanV45(Base):
+    __tablename__ = "permanent_bans_v45"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    reason = Column(String(500), default="")
+    created_by = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class WatchHistoryV45(Base):
+    __tablename__ = "watch_history_v45"
+    __table_args__ = (UniqueConstraint("user_id", "video_id", name="uq_watch_history_v45"),)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id"), nullable=False, index=True)
+    watch_count = Column(Integer, default=1)
+    last_watched = Column(DateTime, default=datetime.utcnow)
+
+class ChannelBanV45(BaseModel):
+    reason: str = Field(default="Copie/copyright de chaîne", max_length=500)
+
+class NotificationV45(BaseModel):
+    enabled: bool = True
+
+
+def v45_official_user(d):
+    return d.query(User).filter(User.is_official == True).order_by(User.id).first()
+
+
+def v45_ensure_official_subscription(d, u):
+    official = v45_official_user(d)
+    if not official or official.id == u.id:
+        return official
+    sub = d.query(Subscription).filter_by(subscriber_id=u.id, channel_id=official.id).first()
+    if not sub:
+        d.add(Subscription(subscriber_id=u.id, channel_id=official.id))
+    pref = d.query(SubscriptionSettingV45).filter_by(subscriber_id=u.id, channel_id=official.id).first()
+    if not pref:
+        d.add(SubscriptionSettingV45(subscriber_id=u.id, channel_id=official.id, notifications_enabled=True))
+    else:
+        pref.notifications_enabled = True
+    d.commit()
+    return official
+
+
+def v45_video(v, d):
+    owner = d.get(User, v.owner_id)
+    return pub_video(v) | {
+        "verified": bool(owner and owner.is_official),
+        "owner_official": bool(owner and owner.is_official),
+    }
+
+
+@app.get("/v45/bootstrap")
+def v45_bootstrap(u: User = Depends(me), d: Session = Depends(db)):
+    official = v45_ensure_official_subscription(d, u)
+    pending = d.query(CreatorVerification).filter_by(user_id=u.id, status="pending").order_by(CreatorVerification.id.desc()).first()
+    unread = d.query(Mail).filter(Mail.recipient_id == u.id, Mail.trash_recipient == False, Mail.is_read == False).count()
+    return {
+        "version": "4.5",
+        "user": pub_user(u) | {"verified": bool(u.is_official)},
+        "unread": unread,
+        "official_channel_id": official.id if official else None,
+        "official_channel": official.channel_name if official else "",
+        "mandatory_official_subscription": bool(official and official.id != u.id),
+        "creator_application": {
+            "status": pending.status if pending else "none",
+            "name": pending.channel_name if pending else "",
+        },
+    }
+
+
+@app.get("/v45/feed")
+def v45_feed(limit: int = 30, authorization: str = Header(default=""), d: Session = Depends(db)):
+    # Au moins 10 recommandations sont demandées quand le catalogue en contient 10.
+    # On ne duplique jamais artificiellement une vidéo juste pour remplir la grille.
+    limit = max(10, min(limit, 60))
+    rows = d.query(Video).filter(Video.status == "published", Video.is_short == False).all()
+    viewer_id = None
+    if authorization.startswith("Bearer "):
+        try:
+            viewer_id = int(jwt.decode(authorization[7:], SECRET, algorithms=["HS256"])["sub"])
+        except Exception:
+            viewer_id = None
+    subscribed = set()
+    liked = set()
+    watched = {}
+    if viewer_id:
+        subscribed = {x.channel_id for x in d.query(Subscription).filter_by(subscriber_id=viewer_id).all()}
+        liked = {x.video_id for x in d.query(VideoLike).filter_by(user_id=viewer_id).all()}
+        watched = {x.video_id: (x.watch_count or 0) for x in d.query(WatchHistoryV45).filter_by(user_id=viewer_id).all()}
+
+    def score(v):
+        owner = d.get(User, v.owner_id)
+        official = bool(owner and owner.is_official)
+        # Chaîne officielle en tête, puis abonnements et engagement.
+        # Les contenus déjà likés sont légèrement moins poussés pour diversifier.
+        return (
+            100000000 if official else 0,
+            10000000 if v.is_featured else 0,
+            1000000 if v.owner_id in subscribed else 0,
+            -25000 if v.id in liked else 0,
+            -(watched.get(v.id, 0) * 75000),
+            (v.views or 0) + (v.likes or 0) * 12,
+            v.id,
+        )
+    rows.sort(key=score, reverse=True)
+    return [v45_video(v, d) for v in rows[:limit]]
+
+
+@app.get("/v45/shorts")
+def v45_shorts(limit: int = 40, d: Session = Depends(db)):
+    limit = max(1, min(limit, 80))
+    rows = d.query(Video).filter(Video.status == "published", Video.is_short == True).all()
+    rows.sort(
+        key=lambda v: (
+            bool(d.get(User, v.owner_id) and d.get(User, v.owner_id).is_official),
+            (v.views or 0) + (v.likes or 0) * 10,
+            v.id,
+        ),
+        reverse=True,
+    )
+    return [v45_video(v, d) for v in rows[:limit]]
+
+
+@app.post("/v45/videos/{vid}/view")
+def v45_record_view(vid: int, authorization: str = Header(default=""), d: Session = Depends(db)):
+    v = d.get(Video, vid)
+    if not v or v.status != "published":
+        raise HTTPException(404, "Vidéo introuvable.")
+    v.views = (v.views or 0) + 1
+    viewer_id = None
+    if authorization.startswith("Bearer "):
+        try:
+            viewer_id = int(jwt.decode(authorization[7:], SECRET, algorithms=["HS256"])["sub"])
+        except Exception:
+            viewer_id = None
+    if viewer_id:
+        row = d.query(WatchHistoryV45).filter_by(user_id=viewer_id, video_id=vid).first()
+        if row:
+            row.watch_count = (row.watch_count or 0) + 1
+            row.last_watched = datetime.utcnow()
+        else:
+            d.add(WatchHistoryV45(user_id=viewer_id, video_id=vid, watch_count=1, last_watched=datetime.utcnow()))
+    d.commit()
+    return {"views": v.views, "tracked": bool(viewer_id)}
+
+
+@app.get("/v45/videos/{vid}/stats")
+def v45_video_stats(vid: int, d: Session = Depends(db)):
+    v = d.get(Video, vid)
+    if not v or v.status != "published":
+        raise HTTPException(404, "Vidéo introuvable.")
+    return {
+        "id": v.id,
+        "views": v.views or 0,
+        "likes": v.likes or 0,
+        "comments": d.query(Comment).filter_by(video_id=vid).count(),
+        "subscribers": d.query(Subscription).filter_by(channel_id=v.owner_id).count(),
+    }
+
+
+@app.get("/v45/videos/stats")
+def v45_video_stats_batch(ids: str = "", d: Session = Depends(db)):
+    wanted = []
+    for part in ids.split(","):
+        try:
+            wanted.append(int(part))
+        except Exception:
+            pass
+    out = {}
+    if not wanted:
+        return out
+    for v in d.query(Video).filter(Video.id.in_(wanted[:100])).all():
+        out[str(v.id)] = {"views": v.views or 0, "likes": v.likes or 0}
+    return out
+
+
+@app.get("/v45/subscriptions/{channel_id}")
+def v45_subscription_status(channel_id: int, u: User = Depends(me), d: Session = Depends(db)):
+    ch = d.get(User, channel_id)
+    if not ch:
+        raise HTTPException(404, "Chaîne introuvable.")
+    if ch.is_official:
+        v45_ensure_official_subscription(d, u)
+    subscribed = bool(d.query(Subscription).filter_by(subscriber_id=u.id, channel_id=channel_id).first())
+    pref = d.query(SubscriptionSettingV45).filter_by(subscriber_id=u.id, channel_id=channel_id).first()
+    return {
+        "subscribed": subscribed,
+        "mandatory": bool(ch.is_official and ch.id != u.id),
+        "notifications": True if ch.is_official else bool(pref.notifications_enabled if pref else subscribed),
+    }
+
+
+@app.post("/v45/subscriptions/{channel_id}")
+def v45_subscribe(channel_id: int, u: User = Depends(me), d: Session = Depends(db)):
+    if channel_id == u.id:
+        raise HTTPException(400, "Impossible de s'abonner à soi-même.")
+    ch = d.get(User, channel_id)
+    if not ch:
+        raise HTTPException(404, "Chaîne introuvable.")
+    if not d.query(Subscription).filter_by(subscriber_id=u.id, channel_id=channel_id).first():
+        d.add(Subscription(subscriber_id=u.id, channel_id=channel_id))
+    pref = d.query(SubscriptionSettingV45).filter_by(subscriber_id=u.id, channel_id=channel_id).first()
+    if not pref:
+        d.add(SubscriptionSettingV45(subscriber_id=u.id, channel_id=channel_id, notifications_enabled=True))
+    d.commit()
+    return {"subscribed": True, "mandatory": bool(ch.is_official), "notifications": True}
+
+
+@app.delete("/v45/subscriptions/{channel_id}")
+def v45_unsubscribe(channel_id: int, u: User = Depends(me), d: Session = Depends(db)):
+    ch = d.get(User, channel_id)
+    if ch and ch.is_official:
+        raise HTTPException(403, "La chaîne officielle Dura est un abonnement système obligatoire.")
+    row = d.query(Subscription).filter_by(subscriber_id=u.id, channel_id=channel_id).first()
+    if row:
+        d.delete(row)
+    d.query(SubscriptionSettingV45).filter_by(subscriber_id=u.id, channel_id=channel_id).delete()
+    d.commit()
+    return {"subscribed": False}
+
+
+@app.put("/v45/subscriptions/{channel_id}/notifications")
+def v45_notifications(channel_id: int, x: NotificationV45, u: User = Depends(me), d: Session = Depends(db)):
+    ch = d.get(User, channel_id)
+    if not ch:
+        raise HTTPException(404, "Chaîne introuvable.")
+    if ch.is_official and not x.enabled:
+        raise HTTPException(403, "Les notifications de la chaîne officielle sont obligatoires.")
+    if not d.query(Subscription).filter_by(subscriber_id=u.id, channel_id=channel_id).first():
+        raise HTTPException(409, "Abonne-toi d'abord à cette chaîne.")
+    pref = d.query(SubscriptionSettingV45).filter_by(subscriber_id=u.id, channel_id=channel_id).first()
+    if not pref:
+        pref = SubscriptionSettingV45(subscriber_id=u.id, channel_id=channel_id)
+        d.add(pref)
+    pref.notifications_enabled = True if ch.is_official else x.enabled
+    d.commit()
+    return {"notifications": bool(pref.notifications_enabled), "mandatory": bool(ch.is_official)}
+
+
+@app.post("/v45/channel/apply")
+async def v45_channel_apply(
+    name: str = Form(...),
+    description: str = Form(""),
+    verification_video: UploadFile = File(...),
+    u: User = Depends(me),
+    d: Session = Depends(db),
+):
+    if u.channel_name:
+        raise HTTPException(409, "Tu as déjà une chaîne.")
+    name = name.strip()[:80]
+    if len(name) < 2:
+        raise HTTPException(400, "Nom de chaîne trop court.")
+    if d.query(User).filter(User.channel_name.ilike(name)).first():
+        raise HTTPException(409, "Une chaîne utilise déjà ce nom.")
+    if d.query(CreatorVerification).filter(CreatorVerification.channel_name.ilike(name), CreatorVerification.status == "pending").first():
+        raise HTTPException(409, "Ce nom est déjà en cours de vérification.")
+    if d.query(CreatorVerification).filter_by(user_id=u.id, status="pending").first():
+        raise HTTPException(409, "Tu as déjà une demande de création en attente.")
+    ext = Path(verification_video.filename or "").suffix.lower()
+    if ext not in {".mp4", ".mov", ".mkv", ".webm", ".m4v"}:
+        raise HTTPException(400, "La vérification doit être une vidéo MP4/MOV/MKV/WEBM/M4V.")
+    reject_oversize(verification_video, 300, "Vidéo de vérification")
+    key = f"creator-verification/{u.id}/{uuid.uuid4().hex}{ext}"
+    try:
+        r2().upload_fileobj(
+            verification_video.file,
+            R2_BUCKET,
+            key,
+            ExtraArgs={"ContentType": verification_video.content_type or "video/mp4"},
+        )
+    except Exception as exc:
+        logger.exception("Upload vérification créateur impossible")
+        raise HTTPException(503, "Impossible d'envoyer la vidéo de vérification.") from exc
+    row = CreatorVerification(
+        user_id=u.id,
+        channel_name=name,
+        description=description[:2000],
+        object_key=key,
+    )
+    d.add(row)
+    d.commit()
+    d.refresh(row)
+    return {
+        "ok": True,
+        "id": row.id,
+        "status": "pending",
+        "message": "Demande envoyée. DuraIndustry doit valider la vidéo avant l'ouverture de la chaîne.",
+    }
+
+
+@app.get("/v45/channel/application")
+def v45_channel_application(u: User = Depends(me), d: Session = Depends(db)):
+    row = d.query(CreatorVerification).filter_by(user_id=u.id).order_by(CreatorVerification.id.desc()).first()
+    if not row:
+        return {"status": "none"}
+    return {
+        "id": row.id,
+        "channel_name": row.channel_name,
+        "status": row.status,
+        "review_note": row.review_note or "",
+        "created_at": row.created_at.isoformat() if row.created_at else "",
+    }
+
+
+@app.get("/v45/admin/creator-verifications")
+def v45_admin_creator_verifications(u: User = Depends(me), d: Session = Depends(db)):
+    if not u.is_admin:
+        raise HTTPException(403)
+    out = []
+    for row in d.query(CreatorVerification).order_by(CreatorVerification.id.desc()).limit(500).all():
+        account = d.get(User, row.user_id)
+        out.append({
+            "id": row.id,
+            "user_id": row.user_id,
+            "address": account.address if account else "",
+            "display_name": account.display_name if account else "",
+            "channel_name": row.channel_name,
+            "description": row.description or "",
+            "status": row.status,
+            "review_note": row.review_note or "",
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+            "video_url": f"/v45/admin/creator-verifications/{row.id}/video",
+        })
+    return out
+
+
+@app.get("/v45/admin/creator-verifications/{rid}/video")
+def v45_admin_creator_video(rid: int, u: User = Depends(me), d: Session = Depends(db)):
+    if not u.is_admin:
+        raise HTTPException(403)
+    row = d.get(CreatorVerification, rid)
+    if not row:
+        raise HTTPException(404)
+    return RedirectResponse(signed(row.object_key))
+
+
+@app.post("/v45/admin/creator-verifications/{rid}/approve")
+def v45_admin_creator_approve(rid: int, u: User = Depends(me), d: Session = Depends(db)):
+    if not u.is_admin:
+        raise HTTPException(403)
+    row = d.get(CreatorVerification, rid)
+    if not row or row.status != "pending":
+        raise HTTPException(404, "Demande introuvable ou déjà traitée.")
+    target = d.get(User, row.user_id)
+    if not target:
+        raise HTTPException(404)
+    if d.query(User).filter(User.id != target.id, User.channel_name.ilike(row.channel_name)).first():
+        raise HTTPException(409, "Ce nom de chaîne vient d'être pris.")
+    target.channel_name = row.channel_name
+    row.status = "approved"
+    row.reviewed_at = datetime.utcnow()
+    row.reviewed_by = u.id
+    profile = d.query(ChannelProfile).filter_by(user_id=target.id).first()
+    if not profile:
+        d.add(ChannelProfile(user_id=target.id, description=row.description or ""))
+    d.commit()
+    return {"ok": True, "user": pub_user(target)}
+
+
+@app.post("/v45/admin/creator-verifications/{rid}/reject")
+def v45_admin_creator_reject(
+    rid: int,
+    note: str = Form("La vidéo ne permet pas de confirmer le créateur."),
+    u: User = Depends(me),
+    d: Session = Depends(db),
+):
+    if not u.is_admin:
+        raise HTTPException(403)
+    row = d.get(CreatorVerification, rid)
+    if not row:
+        raise HTTPException(404)
+    row.status = "rejected"
+    row.review_note = note[:500]
+    row.reviewed_at = datetime.utcnow()
+    row.reviewed_by = u.id
+    d.commit()
+    return {"ok": True}
+
+
+@app.post("/v45/admin/channels/{uid}/copyright-ban")
+def v45_admin_copyright_ban(uid: int, x: ChannelBanV45, u: User = Depends(me), d: Session = Depends(db)):
+    if not u.is_admin:
+        raise HTTPException(403)
+    target = d.get(User, uid)
+    if not target or target.is_official:
+        raise HTTPException(400, "Ce compte ne peut pas être banni par cette action.")
+    # Le bannissement copyright permanent n'est possible qu'après un signalement
+    # explicite de l'administrateur lui-même sur cette chaîne.
+    report = d.query(Report).filter_by(reporter_id=u.id, target_type="channel", target_id=uid, status="open").order_by(Report.id.desc()).first()
+    if not report:
+        raise HTTPException(409, "Signale d'abord cette chaîne depuis DuraTube avec ton compte admin avant le bannissement copyright permanent.")
+    target.is_banned = True
+    if not d.query(PermanentBanV45).filter_by(user_id=uid).first():
+        d.add(PermanentBanV45(user_id=uid, reason=x.reason[:500], created_by=u.id))
+    for v in d.query(Video).filter_by(owner_id=uid).all():
+        v.status = "private"
+    report.status = "resolved"
+    d.commit()
+    return {"ok": True, "permanent": True, "address": target.address}
+
+
+@app.get("/v45/admin/duramail-directory")
+def v45_admin_duramail_directory(q: str = "", u: User = Depends(me), d: Session = Depends(db)):
+    if not u.is_admin:
+        raise HTTPException(403)
+    query = d.query(User)
+    if q:
+        query = query.filter(or_(
+            User.address.ilike(f"%{q}%"),
+            User.display_name.ilike(f"%{q}%"),
+            User.channel_name.ilike(f"%{q}%"),
+        ))
+    return [
+        pub_user(x) | {
+            "verified": bool(x.is_official),
+            "banned": bool(x.is_banned),
+            "created_at": x.created_at.isoformat() if x.created_at else "",
+        }
+        for x in query.order_by(User.address).limit(2500).all()
+    ]
+
+
+class DuraBrainCore3:
+    """DuraBrain Core 3.5.
+
+    No AI API key. The engine combines deterministic tools, conversation memory,
+    Dura account data, lightweight retrieval and optional public encyclopedia
+    lookup. This is deliberately honest: it is not a magically trained frontier
+    LLM, but it is much more useful than the old canned fallback.
+    """
+
+    def __init__(self):
+        self.stop = {"le","la","les","un","une","des","de","du","et","ou","à","a","au","aux","en","dans","sur","pour","par","avec","sans","que","qui","quoi","est","sont","je","tu","il","elle","on","nous","vous","ils","elles","ce","ces","ça","ca","mon","ton","son"}
+        self.facts = {
+            "france": "La France est un pays d'Europe occidentale. Sa capitale est Paris.",
+            "paris": "Paris est la capitale de la France.",
+            "python": "Python est un langage de programmation généraliste très utilisé pour le web, l'automatisation, la data et l'IA.",
+            "fastapi": "FastAPI est un framework Python moderne pour construire des API web typées.",
+            "postgresql": "PostgreSQL est un système de gestion de base de données relationnelle open source.",
+            "cloudflare r2": "Cloudflare R2 est un stockage objet compatible S3.",
+            "duratube": "DuraTube est la plateforme vidéo de l'écosystème Dura.",
+            "duramail": "DuraMail est la messagerie interne @duramail reliée à Dura Cloud.",
+            "duratube studio": "DuraTube Studio est l'application créateur et modération de DuraTube.",
+            "duraia": "DuraIA est l'assistant de l'écosystème Dura, propulsé par DuraBrain.",
+        }
+
+    def tokens(self, text):
+        return re.findall(r"[a-zà-ÿ0-9_+-]+", (text or "").lower())
+
+    def safe_calc(self, expr):
+        expr = (expr or "").replace("×", "*").replace("÷", "/").replace(",", ".").replace("^", "**")
+        expr = re.sub(r"(\d+(?:\.\d+)?)\s*%", r"(\1/100)", expr)
+        try:
+            node = ast.parse(expr, mode="eval")
+            allowed = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow, ast.USub, ast.UAdd, ast.Call, ast.Name, ast.Load)
+            if any(not isinstance(n, allowed) for n in ast.walk(node)):
+                return None
+            names = {"sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan, "pi": math.pi, "e": math.e, "abs": abs, "round": round}
+            for n in ast.walk(node):
+                if isinstance(n, ast.Name) and n.id not in names:
+                    return None
+                if isinstance(n, ast.Call) and (not isinstance(n.func, ast.Name) or n.func.id not in names):
+                    return None
+            value = eval(compile(node, "<durabrain-calc>", "eval"), {"__builtins__": {}}, names)
+            if isinstance(value, float):
+                value = round(value, 10)
+            return str(value)
+        except Exception:
+            return None
+
+    def summarize(self, text, max_sentences=4):
+        text = re.sub(r"\s+", " ", (text or "").strip())
+        if not text:
+            return "Envoie le texte à résumer."
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        if len(sentences) <= max_sentences:
+            return text
+        words = [w for w in self.tokens(text) if w not in self.stop and len(w) > 2]
+        freq = Counter(words)
+        ranked = []
+        for i, sentence in enumerate(sentences):
+            ranked.append((sum(freq[w] for w in self.tokens(sentence)), i, sentence))
+        best = sorted(ranked, reverse=True)[:max_sentences]
+        return " ".join(x[2] for x in sorted(best, key=lambda x: x[1]))
+
+    def wikipedia(self, query):
+        if os.getenv("DURAIA_WEB_KNOWLEDGE", "1") != "1":
+            return None
+        try:
+            import urllib.parse
+            import urllib.request
+            params = urllib.parse.urlencode({
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": query,
+                "gsrlimit": 1,
+                "prop": "extracts|info",
+                "exintro": 1,
+                "explaintext": 1,
+                "inprop": "url",
+                "format": "json",
+                "utf8": 1,
+            })
+            req = urllib.request.Request(
+                "https://fr.wikipedia.org/w/api.php?" + params,
+                headers={"User-Agent": "DuraIA/4.5 knowledge-retrieval"},
+            )
+            with urllib.request.urlopen(req, timeout=4) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            pages = (data.get("query") or {}).get("pages") or {}
+            if not pages:
+                return None
+            page = next(iter(pages.values()))
+            extract = re.sub(r"\s+", " ", page.get("extract", "")).strip()
+            if not extract:
+                return None
+            return self.summarize(extract, 4) + f"\n\nSource de connaissance : Wikipédia — {page.get('fullurl', '')}"
+        except Exception:
+            return None
+
+    def duckduckgo(self, query):
+        if os.getenv("DURAIA_WEB_KNOWLEDGE", "1") != "1":
+            return None
+        try:
+            import urllib.parse
+            import urllib.request
+            url = "https://api.duckduckgo.com/?" + urllib.parse.urlencode({
+                "q": query, "format": "json", "no_html": 1, "skip_disambig": 1, "no_redirect": 1
+            })
+            req = urllib.request.Request(url, headers={"User-Agent": "DuraIA/4.5 knowledge-retrieval"})
+            with urllib.request.urlopen(req, timeout=4) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            text = re.sub(r"\s+", " ", (data.get("AbstractText") or data.get("Answer") or "")).strip()
+            if text:
+                source = data.get("AbstractSource") or "DuckDuckGo"
+                source_url = data.get("AbstractURL") or ""
+                suffix = f"\n\nSource de connaissance : {source}" + (f" — {source_url}" if source_url else "")
+                return self.summarize(text, 5) + suffix
+        except Exception:
+            return None
+        return None
+
+    def knowledge(self, query):
+        # Réponses factuelles sans clé d'API IA : moteur local + sources publiques.
+        local = self.local_fact(query)
+        if local:
+            return local
+        return self.wikipedia(query) or self.duckduckgo(query)
+
+    def contextual_query(self, raw, recent):
+        low = raw.lower().strip()
+        vague = len(self.tokens(raw)) <= 6 and any(x in low for x in ["et ", "il ", "elle ", "ça", "ca", "celui", "celle", "quand", "où", "ou ", "pourquoi", "comment"])
+        if not vague:
+            return raw
+        previous = [m.get("content", "") for m in (recent or []) if m.get("role") == "user" and m.get("content")]
+        if not previous:
+            return raw
+        return previous[-1] + " ; question suivante : " + raw
+
+    def local_fact(self, text):
+        low = text.lower()
+        best = None
+        score = 0
+        for key, value in self.facts.items():
+            current = 4 if key in low else 0
+            current += sum(1 for t in self.tokens(key) if t in self.tokens(low))
+            if current > score:
+                best = value
+                score = current
+        return best if score else None
+
+    def plan(self, goal):
+        goal = goal.strip() or "ton objectif"
+        return (
+            f"Plan pour **{goal}** :\n\n"
+            "1. Définir le résultat attendu et les contraintes.\n"
+            "2. Préparer les ressources nécessaires.\n"
+            "3. Construire une première version testable.\n"
+            "4. Tester les cas principaux et les erreurs.\n"
+            "5. Corriger les blocages.\n"
+            "6. Optimiser l'expérience utilisateur et les performances.\n"
+            "7. Valider sécurité, sauvegardes et déploiement."
+        )
+
+    def answer(self, message, memories, recent, ecosystem):
+        raw = (message or "").strip()
+        low = raw.lower()
+        if not raw:
+            return "Écris-moi une question ou une tâche."
+        if re.fullmatch(r"(?:bonjour|salut|hello|hey|coucou)[ !?.]*", low):
+            return "Salut. Je suis **DuraIA**, propulsée par **DuraBrain Core 3.5**. Je peux répondre à des questions, calculer, résumer, reformuler, préparer des plans, exploiter tes données Dura et chercher des connaissances sans clé d'API IA."
+        if any(x in low for x in ["présente-toi", "presente-toi", "qui es-tu", "tu es qui"]):
+            return "Je suis **DuraIA**, l'assistant de l'écosystème Dura. DuraBrain Core 3.5 combine mémoire, outils, données Dura, calcul et récupération de connaissances. Je ne prétends pas être un grand modèle généraliste du niveau de ChatGPT, mais je ne réponds plus avec des plans absurdes à une simple salutation."
+
+        expr = low
+        for prefix in ("calcule ", "combien font ", "combien fait ", "résous ", "resous "):
+            if expr.startswith(prefix):
+                expr = expr[len(prefix):]
+        calc = self.safe_calc(expr)
+        if calc is not None:
+            return f"**Résultat : {calc}**"
+
+        if low.startswith(("résume ", "resume ", "fais un résumé ", "fais un resume ")):
+            body = re.sub(r"^(résume|resume|fais un résumé|fais un resume)\s*:?\s*", "", raw, flags=re.I)
+            return self.summarize(body)
+        if low.startswith(("reformule ", "réécris ", "reecris ", "corrige ")):
+            body = raw.split(" ", 1)[1] if " " in raw else ""
+            body = re.sub(r"\s+", " ", body).strip()
+            if not body:
+                return "Envoie le texte à reformuler."
+            return body[0].upper() + body[1:] + ("" if body[-1] in ".!?" else ".")
+        if low.startswith(("plan ", "planifie ", "organise ", "comment faire ")):
+            body = re.sub(r"^(plan|planifie|organise|comment faire)\s*", "", raw, flags=re.I)
+            return self.plan(body)
+        if low.startswith(("idées ", "idees ", "brainstorm ")):
+            topic = raw.split(" ", 1)[1] if " " in raw else "ton projet"
+            return "Idées pour **" + topic + "** :\n\n" + "\n".join([
+                "• simplifier le premier parcours utilisateur",
+                "• ajouter une personnalisation visible",
+                "• automatiser les tâches répétitives",
+                "• afficher des statistiques vraiment utiles",
+                "• prévoir un mode créateur et un mode spectateur",
+                "• ajouter une modération claire",
+                "• concevoir le fonctionnement hors-ligne/cache",
+                "• préparer les tests avant publication",
+            ])
+
+        if any(x in low for x in ["mes mails", "mails non lus", "mail non lu", "combien de mails"]):
+            return f"Tu as **{ecosystem.get('unread_mail', 0)} mail(s) non lu(s)** dans DuraMail."
+        if any(x in low for x in ["mes abonnés", "mes abonnes", "combien d'abonnés", "combien d'abonnes"]):
+            if not ecosystem.get("has_channel"):
+                return "Ton compte n'a pas encore de chaîne DuraTube validée."
+            return f"Ta chaîne **{ecosystem.get('channel', '')}** a **{ecosystem.get('subscribers', 0)} abonné(s)**."
+        if any(x in low for x in ["mes vues", "stats de ma chaîne", "statistiques de ma chaîne"]):
+            if not ecosystem.get("has_channel"):
+                return "Ton compte n'a pas encore de chaîne DuraTube validée."
+            return f"Ta chaîne totalise **{ecosystem.get('views', 0)} vues**, **{ecosystem.get('likes', 0)} J'aime** et **{ecosystem.get('videos', 0)} contenu(s)**."
+        if any(x in low for x in ["qui suis-je", "que sais-tu sur moi", "tu sais quoi sur moi"]):
+            data = [f"Compte : {ecosystem.get('address', '')}"]
+            if ecosystem.get("has_channel"):
+                data.append(f"Chaîne : {ecosystem.get('channel', '')}")
+            data.extend(f"{k} : {v}" for k, v in memories.items())
+            return "Voici ce que je peux utiliser :\n" + "\n".join(f"• {x}" for x in data)
+
+        local = self.local_fact(raw)
+        if local and any(x in low for x in ["c'est quoi", "cest quoi", "qu'est-ce", "qui est", "quelle est", "quel est", "explique", "définis", "definis"]):
+            return local
+
+        if low.startswith(("écris ", "ecris ", "rédige ", "redige ")):
+            topic = raw.split(" ", 1)[1] if " " in raw else "ton sujet"
+            return f"Voici un brouillon sur **{topic}** :\n\n{topic.capitalize()} doit être présenté avec une idée principale claire dès le début. Développe ensuite les informations essentielles dans un ordre logique, ajoute un exemple concret et termine par une conclusion courte."
+
+        if any(x in low for x in ["quelle heure", "quel jour", "quelle date", "date d'aujourd'hui", "date aujourd'hui"]):
+            now = datetime.now(timezone.utc)
+            return f"Côté Dura Cloud, nous sommes le **{now.strftime('%d/%m/%Y')}** à **{now.strftime('%H:%M')} UTC**."
+
+        if "?" in raw or low.startswith(("qui ", "quoi ", "où ", "ou ", "quand ", "quel ", "quelle ", "combien ", "pourquoi ", "explique ", "donne-moi ", "donne moi ")):
+            query = self.contextual_query(raw, recent)
+            found = self.knowledge(query)
+            if found:
+                return found
+
+        # Dernière tentative de connaissance pour une demande déclarative courte.
+        if len(self.tokens(raw)) >= 2:
+            found = self.knowledge(self.contextual_query(raw, recent))
+            if found:
+                return found
+
+        return "Je n'ai pas trouvé de connaissance suffisamment fiable pour répondre sans inventer. Reformule avec un sujet précis, ou demande-moi un calcul, un résumé, une reformulation, un plan, tes statistiques Dura ou une recherche factuelle."
+
+
+DURABRAIN3 = DuraBrainCore3()
+
+
+@app.get("/v45/ai/status")
+def v45_ai_status(u: User = Depends(me), d: Session = Depends(db)):
+    access = d.query(AiAccess).filter_by(user_id=u.id).first()
+    return {
+        "verified": bool(access and access.verified),
+        "engine": "DuraBrain Core 3.5",
+        "external_ai_api": False,
+        "web_knowledge": os.getenv("DURAIA_WEB_KNOWLEDGE", "1") == "1",
+    }
+
+
+@app.post("/v45/ai/chat")
+def v45_ai_chat(x: AiChat, u: User = Depends(me), d: Session = Depends(db)):
+    ai_verified(u, d)
+    c = d.get(AiConversation, x.conversation_id) if x.conversation_id else None
+    if not c or c.user_id != u.id:
+        c = AiConversation(user_id=u.id, title=(x.message.strip()[:60] or "Nouvelle conversation"))
+        d.add(c)
+        d.commit()
+        d.refresh(c)
+
+    low = x.message.lower().strip()
+    if low.startswith("retiens que "):
+        body = x.message[11:].strip()
+        parts = re.split(r"\s*=\s*|\s+est\s+", body, maxsplit=1)
+        if len(parts) == 2:
+            key, value = parts[0].strip()[:80], parts[1].strip()[:4000]
+            row = d.query(AiMemory).filter_by(user_id=u.id, key=key).first()
+            if row:
+                row.value = value
+                row.updated_at = datetime.utcnow()
+            else:
+                d.add(AiMemory(user_id=u.id, key=key, value=value))
+            answer = f"Je retiens : {key} = {value}."
+        else:
+            answer = "Utilise par exemple : retiens que projet = DuraTube."
+    else:
+        recent_rows = d.query(AiMessage).filter_by(conversation_id=c.id).order_by(AiMessage.id.desc()).limit(12).all()
+        recent = [{"role": m.role, "content": m.content} for m in reversed(recent_rows)]
+        memories = {m.key: m.value for m in d.query(AiMemory).filter_by(user_id=u.id).all()}
+        vids = d.query(Video).filter_by(owner_id=u.id).all()
+        ecosystem = {
+            "address": u.address,
+            "has_channel": bool(u.channel_name),
+            "channel": u.channel_name or "",
+            "unread_mail": d.query(Mail).filter(Mail.recipient_id == u.id, Mail.trash_recipient == False, Mail.is_read == False).count(),
+            "subscribers": d.query(Subscription).filter_by(channel_id=u.id).count() if u.channel_name else 0,
+            "views": sum(v.views or 0 for v in vids),
+            "likes": sum(v.likes or 0 for v in vids),
+            "videos": len(vids),
+        }
+        answer = DURABRAIN3.answer(x.message, memories, recent, ecosystem)
+
+    d.add(AiMessage(conversation_id=c.id, role="user", content=x.message))
+    d.add(AiMessage(conversation_id=c.id, role="assistant", content=answer))
+    c.updated_at = datetime.utcnow()
+    d.commit()
+    return {"text": answer, "conversation_id": c.id, "engine": "DuraBrain Core 3.5"}
