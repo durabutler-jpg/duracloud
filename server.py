@@ -6,6 +6,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
+from fastapi.middleware.gzip import GZipMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, or_, UniqueConstraint, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from argon2 import PasswordHasher
@@ -121,7 +122,8 @@ class Report(Base):
     __tablename__="reports"
     id=Column(Integer,primary_key=True); reporter_id=Column(Integer,ForeignKey("users.id"),nullable=False); target_type=Column(String(30),nullable=False); target_id=Column(Integer,nullable=False); reason=Column(String(300),default=""); status=Column(String(30),default="open"); created_at=Column(DateTime,default=datetime.utcnow)
 
-app=FastAPI(title="Dura Cloud",version="4.2")
+app=FastAPI(title="Dura Cloud",version="4.4")
+app.add_middleware(GZipMiddleware, minimum_size=700)
 
 def db():
     d=SessionLocal()
@@ -210,9 +212,9 @@ def bootstrap():
 
 @app.get("/")
 def status():
-    return {"service":"Dura Cloud","version":"4.2","status":"online" if DATABASE_READY else "degraded",
-            "release":"ui-rebuild-candidate","duratube":True,"studio":True,"duramail":True,
-            "duraia":"DuraBrain Local 1.2","database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
+    return {"service":"Dura Cloud","version":"4.4","status":"online" if DATABASE_READY else "degraded",
+            "release":"ultra-desktop-candidate","duratube":True,"studio":True,"duramail":True,
+            "duraia":"DuraBrain Core 2.0","database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
             "warnings":CONFIG_WARNINGS}
 
 @app.get("/health")
@@ -227,13 +229,13 @@ def health():
     r2_cfg=bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET)
     secret_persistent=bool(os.getenv("DURA_SECRET","").strip())
     return {"ok":db_ok,"database":db_ok,"r2_configured":r2_cfg,"secret_persistent":secret_persistent,
-            "warnings":CONFIG_WARNINGS,"version":"4.2"}
+            "warnings":CONFIG_WARNINGS,"version":"4.4"}
 
 @app.get("/ready")
 def ready():
     if not DATABASE_READY:
         raise HTTPException(503,"Dura Cloud démarre mais la base de données n'est pas prête. Consulte /health et les logs Render.")
-    return {"ready":True,"version":"4.2"}
+    return {"ready":True,"version":"4.4"}
 
 @app.patch("/account/profile")
 def update_profile(x:ProfileIn,u:User=Depends(me),d:Session=Depends(db)):
@@ -269,6 +271,16 @@ def login(x:Login,d:Session=Depends(db)):
     return {"token":make_token(u),"user":pub_user(u)}
 @app.get("/auth/me")
 def auth_me(u:User=Depends(me)):return pub_user(u)
+
+@app.get("/bootstrap")
+def bootstrap_payload(u:User=Depends(me),d:Session=Depends(db)):
+    t=d.query(ThemeProfile).filter_by(user_id=u.id).first() or ThemeProfile(user_id=u.id)
+    unread=d.query(Mail).filter(Mail.recipient_id==u.id,Mail.trash_recipient==False,Mail.is_read==False).count()
+    channel_data=None
+    if u.channel_name:
+        p=d.query(ChannelProfile).filter_by(user_id=u.id).first() or ChannelProfile(user_id=u.id)
+        channel_data={"name":u.channel_name,"description":p.description or "","subscribers":d.query(Subscription).filter_by(channel_id=u.id).count(),"videos":d.query(Video).filter_by(owner_id=u.id,status="published").count()}
+    return {"user":pub_user(u),"unread":unread,"theme":{k:getattr(t,k) for k in ["accent","background","surface","text","font","radius","density","graphic"]},"channel":channel_data,"version":"4.4"}
 
 @app.get("/theme/me")
 def theme_me(u:User=Depends(me),d:Session=Depends(db)):
@@ -554,6 +566,18 @@ def studio_analytics(u:User=Depends(me),d:Session=Depends(db)):
     top=sorted(vids,key=lambda v:(v.views or 0,v.likes or 0),reverse=True)[:5]
     return {"subscribers":d.query(Subscription).filter_by(channel_id=u.id).count(),"videos":len(vids),"views":total_views,"likes":total_likes,"engagement":round((total_likes/max(total_views,1))*100,2),"top":[pub_video(v) for v in top]}
 
+@app.get("/studio/comments")
+def studio_comments(u:User=Depends(me),d:Session=Depends(db)):
+    if not u.channel_name:raise HTTPException(403,"Aucune chaîne.")
+    vids={v.id:v for v in d.query(Video).filter_by(owner_id=u.id).all()}
+    if not vids:return []
+    rows=d.query(Comment).filter(Comment.video_id.in_(list(vids.keys()))).order_by(Comment.id.desc()).limit(200).all()
+    out=[]
+    for c in rows:
+        author=d.get(User,c.user_id);v=vids.get(c.video_id)
+        out.append({"id":c.id,"video_id":c.video_id,"video_title":v.title if v else "","username":(author.channel_name or author.display_name) if author else "Utilisateur","content":c.content,"created_at":c.created_at.strftime("%d/%m/%Y %H:%M") if c.created_at else ""})
+    return out
+
 @app.post("/reports")
 def create_report(x:ReportIn,u:User=Depends(me),d:Session=Depends(db)):
     if x.target_type not in {"video","post","comment","channel"}:raise HTTPException(400,"Type de signalement invalide.")
@@ -629,6 +653,18 @@ def post_like(pid:int,u:User=Depends(me),d:Session=Depends(db)):
 STOPWORDS={"le","la","les","un","une","des","de","du","et","ou","a","à","au","aux","en","dans","pour","par","sur","avec","sans","ce","cette","ces","je","tu","il","elle","on","nous","vous","ils","elles","que","qui","quoi","est","sont","être","avoir","fait","faire","plus","pas","ne","mon","ma","mes","ton","ta","tes","son","sa","ses"}
 
 class DuraBrain:
+    KNOWLEDGE={
+        "api":"Une API est une interface qui permet à deux logiciels de communiquer avec des règles précises.",
+        "serveur":"Un serveur reçoit des requêtes, exécute une logique et renvoie des données ou des fichiers aux applications clientes.",
+        "cloud":"Le cloud désigne des ressources informatiques accessibles à distance, par Internet, au lieu d'être uniquement sur le PC de l'utilisateur.",
+        "base de données":"Une base de données stocke et organise des informations pour pouvoir les retrouver, les modifier et les relier efficacement.",
+        "postgresql":"PostgreSQL est un système de base de données relationnelle robuste et open source.",
+        "python":"Python est un langage de programmation généraliste connu pour sa syntaxe lisible et son vaste écosystème.",
+        "ia":"Une intelligence artificielle est un système informatique conçu pour effectuer des tâches qui demandent habituellement de l'analyse, de la prédiction ou de la génération.",
+        "llm":"Un LLM est un grand modèle de langage entraîné sur énormément de texte pour prédire et générer du langage.",
+        "jwt":"Un JWT est un jeton signé qui transporte des informations d'authentification entre un client et un serveur.",
+        "r2":"Cloudflare R2 est un stockage d'objets compatible S3, adapté aux médias et fichiers volumineux.",
+    }
     def tokenize(self,text):return re.findall(r"[a-zA-ZÀ-ÿ0-9']+",text.lower())
     def sentences(self,text):return [x.strip() for x in re.split(r"(?<=[.!?])\s+|\n+",text.strip()) if x.strip()]
     def safe_math(self,expr):
@@ -638,77 +674,101 @@ class DuraBrain:
             if isinstance(n,ast.Constant) and isinstance(n.value,(int,float)):return n.value
             if isinstance(n,ast.BinOp) and type(n.op) in allowed:
                 a,b=ev(n.left),ev(n.right)
-                if isinstance(n.op,ast.Pow) and abs(b)>10:raise ValueError()
+                if isinstance(n.op,ast.Pow) and abs(b)>12:raise ValueError()
                 return allowed[type(n.op)](a,b)
             if isinstance(n,ast.UnaryOp) and type(n.op) in allowed:return allowed[type(n.op)](ev(n.operand))
             raise ValueError()
-        tree=ast.parse(expr,mode="eval");return ev(tree)
+        return ev(ast.parse(expr,mode="eval"))
     def summarize(self,text,limit=4):
         sents=self.sentences(text)
-        if len(sents)<=limit:return "\n".join(sents)
+        if not sents:return "Je n'ai pas reçu de texte à résumer."
+        if len(sents)<=limit:return " ".join(sents)
         words=[w for w in self.tokenize(text) if w not in STOPWORDS and len(w)>2];freq=Counter(words)
         scored=[]
         for i,s in enumerate(sents):
             toks=[w for w in self.tokenize(s) if w not in STOPWORDS];score=sum(freq[w] for w in toks)/(len(toks)+1);scored.append((score,i,s))
-        chosen=sorted(sorted(scored,reverse=True)[:limit],key=lambda x:x[1]);return " ".join(x[2] for x in chosen)
+        return " ".join(x[2] for x in sorted(sorted(scored,reverse=True)[:limit],key=lambda x:x[1]))
     def rewrite(self,text):
-        t=text.strip();t=re.sub(r"\s+"," ",t);t=re.sub(r"\s+([,.!?;:])",r"\1",t)
+        t=re.sub(r"\s+"," ",text.strip());t=re.sub(r"\s+([,.!?;:])",r"\1",t)
         if t:t=t[0].upper()+t[1:]
         if t and t[-1] not in ".!?":t+="."
         return t
     def brainstorm(self,topic):
         topic=topic.strip() or "ton projet"
-        frames=["Version simple et rapide","Version premium","Angle communauté","Angle viral","Angle utile au quotidien","Angle automatisation","Angle personnalisation","Angle collaboration"]
-        return "\n".join(f"{i+1}. {f} autour de {topic}." for i,f in enumerate(frames))
+        angles=["simple à comprendre","premium","communautaire","viral","utile au quotidien","automatisé","très personnalisable","collaboratif","mobile-first","créateur-first"]
+        return "Voici 10 pistes pour **"+topic+"** :\n"+"\n".join(f"{i+1}. Une version {a} de {topic}." for i,a in enumerate(angles))
     def plan(self,goal):
-        return f"Objectif : {goal.strip()}\n\n1. Définir le résultat exact.\n2. Faire une version minimale testable.\n3. Tester avec un vrai utilisateur.\n4. Corriger les blocages.\n5. Ajouter les fonctions importantes.\n6. Vérifier sécurité, erreurs et sauvegardes.\n7. Préparer la publication et une checklist de lancement."
+        g=goal.strip().rstrip("?.!") or "ton objectif"
+        return f"Voici un plan clair pour **{g}** :\n\n1. Définir le résultat attendu.\n2. Identifier ce qui est indispensable.\n3. Construire une première version fonctionnelle.\n4. Tester les parcours principaux.\n5. Corriger les blocages et simplifier l'interface.\n6. Ajouter les fonctions avancées.\n7. Vérifier sécurité, erreurs et sauvegardes.\n8. Préparer une vraie version de publication."
+    def previous_user(self,context):
+        return next((m.get("content","") for m in reversed(context or []) if m.get("role")=="user"),"")
+    def known_definition(self,raw):
+        low=raw.lower()
+        for k,v in self.KNOWLEDGE.items():
+            if k in low:return v
+        return None
     def answer(self,message,memories,context=None):
-        raw=message.strip();low=raw.lower();tokens=set(self.tokenize(raw));context=context or []
+        raw=message.strip();low=raw.lower().strip();tokens=set(self.tokenize(raw));context=context or []
+        if not raw:return "Écris-moi quelque chose et je m'en occupe."
+        if any(x in low for x in ["présente-toi","presente-toi","qui es-tu","tu es qui"]):
+            return "Salut, je suis **DuraIA**, l'assistant de l'écosystème Dura. Je fonctionne avec **DuraBrain Core 2.0**, un moteur maison sans clé API externe. Je peux t'aider à calculer, résumer, reformuler, organiser des idées, préparer des plans, écrire des brouillons, expliquer certains sujets et travailler avec les services Dura."
+        if low in {"bonjour","salut","hello","hey","wesh","yo"} or low.startswith(("bonjour ","salut ","hello ")):
+            return "Salut 👋 Je suis DuraIA. Dis-moi ce que tu veux faire et je vais essayer de te donner une réponse directement utile."
+        if any(x in low for x in ["que peux-tu faire","tu peux faire quoi","tes capacités","tes capacites"]):
+            return "Je peux notamment :\n\n• faire des calculs ;\n• résumer un texte ;\n• reformuler et corriger ;\n• proposer des idées et des titres ;\n• construire un plan ;\n• expliquer des notions que je connais ;\n• conserver de petites informations dans ma mémoire Dura ;\n• t'aider sur DuraTube, Studio et DuraMail."
         if low.startswith(("calcule ","calcul ")):
             expr=raw.split(" ",1)[1].replace("×","*").replace("÷","/").replace("^","**")
-            try:return f"Résultat : {self.safe_math(expr)}"
-            except Exception:return "Je n'arrive pas à interpréter ce calcul. Utilise par exemple : calcule (12+8)*3."
+            try:return f"Résultat : **{self.safe_math(expr)}**"
+            except Exception:return "Je n'arrive pas à interpréter ce calcul. Essaie par exemple : `calcule (12+8)*3`."
         if re.fullmatch(r"[0-9\s+\-*/().,%^]+",raw):
-            try:return f"Résultat : {self.safe_math(raw.replace('^','**'))}"
+            try:return f"Résultat : **{self.safe_math(raw.replace('^','**'))}**"
             except Exception:pass
         if low.startswith(("résume ","resume ","résumer ","resumer ")):
-            text=raw.split(" ",1)[1] if " " in raw else "";return "Résumé :\n"+self.summarize(text)
-        if low.startswith(("réécris ","reecris ","corrige ","reformule ")):
-            text=raw.split(" ",1)[1] if " " in raw else "";return self.rewrite(text)
-        if low.startswith(("idées ","idees ","brainstorm ")):
-            topic=raw.split(" ",1)[1] if " " in raw else ""; topic=re.sub(r"^(pour|sur)\s+","",topic,flags=re.I); return self.brainstorm(topic)
-        if low.startswith(("plan ","planifie ","organise ")):
-            return self.plan(raw.split(" ",1)[1] if " " in raw else raw)
-        if low.startswith(("explique ","explique-moi ")):
-            subject=raw.split(" ",1)[1] if " " in raw else raw
-            return f"Explication structurée de {subject} :\n\n• Idée principale : identifie ce que c'est et à quoi ça sert.\n• Fonctionnement : découpe le sujet en étapes simples.\n• Exemple : applique-le à un cas concret.\n• Vérification : regarde ce qui peut échouer ou être mal compris.\n\nSi tu me donnes le texte ou les données exactes, je peux les restructurer directement."
-        if low.startswith(("liste ","fais une liste ")):
-            subject=raw.split(" ",1)[1] if " " in raw else raw
-            return "Liste de travail :\n"+"\n".join(f"{i}. {x}" for i,x in enumerate([f"Définir {subject}",f"Préparer les éléments nécessaires",f"Construire une première version",f"Tester le résultat",f"Corriger les problèmes",f"Finaliser et publier"],1))
-        if low.startswith(("compare ","comparaison ")):
-            subject=raw.split(" ",1)[1] if " " in raw else raw
-            return f"Comparaison de {subject} :\n\n1. Objectif\n2. Facilité d'utilisation\n3. Fonctionnalités\n4. Performances\n5. Personnalisation\n6. Coût et contraintes\n7. Meilleur choix selon l'usage"
-        if low.startswith(("titre ","titres ")):
+            return "**Résumé**\n\n"+self.summarize(raw.split(" ",1)[1] if " " in raw else "")
+        if low.startswith(("réécris ","reecris ","corrige ","reformule ","améliore ce texte ","ameliore ce texte ")):
+            return self.rewrite(raw.split(" ",1)[1] if " " in raw else "")
+        if low.startswith(("idées ","idees ","brainstorm ","donne-moi des idées","donne moi des idees")):
+            topic=re.sub(r"^(idées|idees|brainstorm|donne-moi des idées|donne moi des idees)\s*(pour|sur)?\s*","",raw,flags=re.I)
+            return self.brainstorm(topic)
+        if low.startswith(("plan ","planifie ","organise ","fais-moi un plan","fais moi un plan")):
+            goal=re.sub(r"^(plan|planifie|organise|fais-moi un plan|fais moi un plan)\s*(pour|de)?\s*","",raw,flags=re.I)
+            return self.plan(goal)
+        if low.startswith(("titre ","titres ","donne-moi des titres","donne moi des titres")):
+            topic=re.sub(r"^(titre|titres|donne-moi des titres|donne moi des titres)\s*(pour|sur)?\s*","",raw,flags=re.I) or "ton sujet"
+            return "Voici quelques titres :\n\n"+"\n".join([f"• {topic} : le guide complet",f"• J'ai testé {topic}",f"• Tout comprendre sur {topic}",f"• {topic}, mais en mieux",f"• Ce que personne ne te dit sur {topic}"])
+        if low.startswith(("écris ","ecris ","rédige ","redige ")):
             topic=raw.split(" ",1)[1] if " " in raw else "ton sujet"
-            return "Propositions de titres :\n"+"\n".join([f"• {topic} : le guide complet",f"• Tout comprendre sur {topic}",f"• {topic} : ce qu'il faut savoir",f"• J'ai testé {topic}",f"• {topic}, mais en mieux"])
-        if "duratube" in tokens:
-            return "DuraTube est la plateforme vidéo de l'écosystème Dura. Le compte est un compte Dura @duramail, les médias sont stockés sur R2 et DuraTube Studio sert à gérer une chaîne."
-        if "duramail" in tokens:
-            return "DuraMail est la messagerie interne de l'écosystème Dura. Les messages passent par Dura Cloud et peuvent contenir une pièce jointe."
-        if "studio" in tokens and "dura" in low:
-            return "DuraTube Studio sert à gérer ta chaîne : vidéos, statistiques, personnalisation et communauté."
+            return f"Voici un premier brouillon sur **{topic}** :\n\n{topic.capitalize()} mérite une présentation claire, avec une idée principale dès le début. Ensuite, développe les points les plus importants dans un ordre logique, ajoute un exemple concret, puis termine par une conclusion qui résume l'essentiel.\n\nSi tu me donnes le format exact attendu, je peux le restructurer davantage."
         if any(x in low for x in ["qui suis-je","que sais-tu sur moi","tu sais quoi sur moi"]):
             if not memories:return "Je n'ai encore rien mémorisé à ton sujet dans DuraIA."
             return "Voici ce que j'ai en mémoire :\n"+"\n".join(f"• {k} : {v}" for k,v in memories.items())
-        if low in {"bonjour","salut","hello","hey","wesh"}:return "Salut. Je suis DuraIA, le moteur IA maison de l'écosystème Dura. Je peux calculer, résumer, reformuler, brainstormer, planifier et t'aider sur les apps Dura."
+        if "duratube" in low:
+            return "**DuraTube** est la plateforme vidéo de l'écosystème Dura. Les comptes utilisent @duramail, les médias sont stockés sur R2 et DuraTube Studio sert à gérer les chaînes, le contenu et les statistiques."
+        if "duramail" in low:
+            return "**DuraMail** est la messagerie centrale de l'écosystème Dura. Les messages et comptes sont synchronisés par Dura Cloud, avec prise en charge des pièces jointes."
+        if "dura" in low and "studio" in low:
+            return "**DuraTube Studio** est l'espace créateur : contenu, statistiques, commentaires, personnalisation et communauté."
+        definition=self.known_definition(raw)
+        if definition and any(x in low for x in ["c'est quoi","cest quoi","qu'est-ce que","explique","définis","definis"]):
+            return definition+"\n\nSi tu veux, je peux aussi te le découper en étapes ou donner un exemple."
+        if low.startswith(("explique ","explique-moi ","explique moi ")):
+            subject=re.sub(r"^explique(?:-moi| moi)?\s+","",raw,flags=re.I)
+            definition=self.known_definition(subject)
+            if definition:return definition+"\n\n**En pratique :** commence par identifier son rôle, puis ce qu'il reçoit, ce qu'il produit et avec quoi il communique."
+            return f"Pour comprendre **{subject}**, sépare le sujet en quatre questions :\n\n1. Qu'est-ce que c'est ?\n2. À quoi ça sert ?\n3. Comment ça fonctionne ?\n4. Quel exemple concret permet de le vérifier ?\n\nDonne-moi une définition, un texte ou des données sur le sujet et je pourrai les organiser plus précisément."
+        if low.startswith(("comment ","comment faire ")):
+            subject=re.sub(r"^comment(?: faire)?\s+","",raw,flags=re.I)
+            return self.plan(subject)
+        if low.startswith(("pourquoi ",)):
+            subject=raw[9:].strip()
+            return f"Pour répondre proprement à **pourquoi {subject}**, il faut regarder la cause immédiate, les facteurs qui l'ont rendue possible et les conséquences. Si tu me donnes le contexte exact, je peux ensuite construire l'explication point par point."
         if "merci" in tokens:return "Avec plaisir."
-        if any(x in low for x in ["et après","et apres","continue","suite"]) and context:
-            previous=next((m.get("content","") for m in reversed(context) if m.get("role")=="user"),"")
-            if previous:return self.plan(previous)
-        # Lightweight keyword synthesis, no external provider.
+        if any(x in low for x in ["et après","et apres","continue","suite"]):
+            prev=self.previous_user(context)
+            if prev:return self.plan(prev)
         important=[w for w in self.tokenize(raw) if w not in STOPWORDS and len(w)>2][:8]
-        subject=" ".join(important[:4]) or "ta demande"
-        return f"Je comprends que ta demande concerne {subject}. Mon moteur local n'est pas un grand modèle de langage externe : je peux surtout structurer le problème.\n\n{self.plan(raw)}"
+        subject=" ".join(important[:5]) or "ta demande"
+        return f"Je vois que tu veux travailler sur **{subject}**. Je peux déjà t'aider de trois façons :\n\n1. clarifier exactement le résultat que tu veux ;\n2. transformer l'idée en étapes concrètes ;\n3. produire un premier brouillon ou une structure testable.\n\nPour cette demande précise, donne-moi les éléments de départ les plus importants et je construis la suite à partir d'eux."
 
 BRAIN=DuraBrain()
 
@@ -720,7 +780,7 @@ def ai_memories(user_id,d):return {m.key:m.value for m in d.query(AiMemory).filt
 
 @app.get("/ai/status")
 def ai_status(u:User=Depends(me),d:Session=Depends(db)):
-    a=d.query(AiAccess).filter_by(user_id=u.id).first();return {"verified":bool(a and a.verified),"engine":"DuraBrain Local 1.2","provider_ready":True,"external_api":False}
+    a=d.query(AiAccess).filter_by(user_id=u.id).first();return {"verified":bool(a and a.verified),"engine":"DuraBrain Core 2.0","provider_ready":True,"external_api":False}
 
 @app.post("/ai/request-code")
 def ai_request_code(u:User=Depends(me),d:Session=Depends(db)):
@@ -787,4 +847,4 @@ def ai_chat(x:AiChat,u:User=Depends(me),d:Session=Depends(db)):
         recent=[{"role":m.role,"content":m.content} for m in reversed(recent_rows)]
         answer=BRAIN.answer(x.message,ai_memories(u.id,d),recent)
     d.add(AiMessage(conversation_id=c.id,role="user",content=x.message));d.add(AiMessage(conversation_id=c.id,role="assistant",content=answer));c.updated_at=datetime.utcnow();d.commit()
-    return {"text":answer,"conversation_id":c.id,"engine":"DuraBrain Local 1.2"}
+    return {"text":answer,"conversation_id":c.id,"engine":"DuraBrain Core 2.0"}
