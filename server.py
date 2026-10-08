@@ -124,7 +124,7 @@ class Report(Base):
     __tablename__="reports"
     id=Column(Integer,primary_key=True); reporter_id=Column(Integer,ForeignKey("users.id"),nullable=False); target_type=Column(String(30),nullable=False); target_id=Column(Integer,nullable=False); reason=Column(String(300),default=""); status=Column(String(30),default="open"); created_at=Column(DateTime,default=datetime.utcnow)
 
-app=FastAPI(title="Dura Cloud",version="5.0")
+app=FastAPI(title="Dura Cloud",version="7.0")
 app.add_middleware(GZipMiddleware, minimum_size=700)
 
 def db():
@@ -216,9 +216,9 @@ def bootstrap():
 
 @app.get("/")
 def status():
-    return {"service":"Dura Cloud","version":"6.0","status":"online" if DATABASE_READY else "degraded",
-            "release":"atlas-desktop-candidate","duratube":True,"studio":True,"duramail":True,
-            "duraia":"DuraBrain 6.0","database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
+    return {"service":"Dura Cloud","version":"7.0","status":"online" if DATABASE_READY else "degraded",
+            "release":"orbit-desktop-candidate","duratube":True,"studio":True,"duramail":True,
+            "duraia":"DuraBrain 7.0","duraweb":True,"duramr":True,"database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
             "warnings":CONFIG_WARNINGS}
 
 @app.get("/health")
@@ -233,13 +233,13 @@ def health():
     r2_cfg=bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET)
     secret_persistent=bool(os.getenv("DURA_SECRET","").strip())
     return {"ok":db_ok,"database":db_ok,"r2_configured":r2_cfg,"secret_persistent":secret_persistent,
-            "warnings":CONFIG_WARNINGS,"version":"6.0"}
+            "warnings":CONFIG_WARNINGS,"version":"7.0"}
 
 @app.get("/ready")
 def ready():
     if not DATABASE_READY:
         raise HTTPException(503,"Dura Cloud démarre mais la base de données n'est pas prête. Consulte /health et les logs Render.")
-    return {"ready":True,"version":"6.0"}
+    return {"ready":True,"version":"7.0"}
 
 @app.patch("/account/profile")
 def update_profile(x:ProfileIn,u:User=Depends(me),d:Session=Depends(db)):
@@ -287,7 +287,7 @@ def bootstrap_payload(u:User=Depends(me),d:Session=Depends(db)):
     if u.channel_name:
         p=d.query(ChannelProfile).filter_by(user_id=u.id).first() or ChannelProfile(user_id=u.id)
         channel_data={"name":u.channel_name,"description":p.description or "","subscribers":d.query(Subscription).filter_by(channel_id=u.id).count(),"videos":d.query(Video).filter_by(owner_id=u.id,status="published").count()}
-    return {"user":pub_user(u),"unread":unread,"theme":{k:getattr(t,k) for k in ["accent","background","surface","text","font","radius","density","graphic"]},"channel":channel_data,"version":"6.0"}
+    return {"user":pub_user(u),"unread":unread,"theme":{k:getattr(t,k) for k in ["accent","background","surface","text","font","radius","density","graphic"]},"channel":channel_data,"version":"7.0"}
 
 @app.get("/theme/me")
 def theme_me(u:User=Depends(me),d:Session=Depends(db)):
@@ -2020,3 +2020,402 @@ def v50_ai_chat(x:AiChat,u:User=Depends(me),d:Session=Depends(db)):
         answer,sources=DURABRAIN5.answer(x.message,memories,recent,ecosystem,web_enabled=bool(x.web),language=x.language or 'auto')
     d.add(AiMessage(conversation_id=c.id,role='user',content=x.message));d.add(AiMessage(conversation_id=c.id,role='assistant',content=answer));c.updated_at=datetime.utcnow();d.commit()
     return {'conversation_id':c.id,'text':answer,'engine':('Mode hybride (modèle configuré, repli possible)' if DURA_MODEL_URL else 'Recherche et outils'),'sources':sources,'language':DURABRAIN5.web.detect_language(x.message)}
+
+
+# === ORBIT v7 embedded modules: deploy requires only server.py and requirements.txt ===
+
+# BEGIN dura_search.py
+"""DuraWeb federated public search. No paid API key and no pretence of owning a web index.
+Search uses RSS/HTML from public websites; results vary with provider availability.
+"""
+import html, ipaddress, json, re, socket, urllib.parse, urllib.request, urllib.error
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+
+UA = 'DuraWeb/7.0 (+https://duracloud.onrender.com; public search client)'
+MAX_RESULTS=20
+
+def fetch(url, max_bytes=800000, timeout=6, html_only=False):
+    req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'application/json,text/html,application/rss+xml,application/xml;q=0.8'})
+    with urllib.request.urlopen(req,timeout=timeout) as r:
+        ctype=r.headers.get('Content-Type','').lower()
+        if html_only and not any(s in ctype for s in ['text/html','text/plain']):
+            raise ValueError('Type de document non pris en charge')
+        return r.read(max_bytes+1)[:max_bytes].decode('utf-8','replace')
+
+def sanitize_text(value,limit=700):
+    text=html.unescape(re.sub('<[^>]*>',' ',str(value or '')))
+    text=re.sub(r'\s+',' ',text).strip()
+    return text[:limit]
+
+def clean_url(link):
+    link=html.unescape(str(link or '').strip())
+    if link.startswith('//'):link='https:'+link
+    p=urllib.parse.urlsplit(link)
+    if p.netloc.endswith('duckduckgo.com'):
+        qs=urllib.parse.parse_qs(p.query);link=qs.get('uddg',[link])[0]
+        p=urllib.parse.urlsplit(link)
+    return link if p.scheme in ('http','https') and p.netloc else ''
+
+class DuckResults(HTMLParser):
+    def __init__(self):super().__init__();self.results=[];self.current=None;self.in_title=False
+    def handle_starttag(self,tag,attrs):
+        attrs=dict(attrs);cls=attrs.get('class','')
+        if tag=='a' and ('result__a' in cls or 'result-link' in cls):
+            self.current={'title':'','url':clean_url(attrs.get('href','')),'snippet':'','source':'DuckDuckGo'};self.in_title=True
+    def handle_endtag(self,tag):
+        if tag=='a' and self.in_title:
+            self.in_title=False
+            if self.current and self.current.get('url') and self.current.get('title'):
+                self.results.append(self.current)
+            self.current=None
+    def handle_data(self,data):
+        if self.in_title and self.current:self.current['title']+=data
+
+def ddg(query):
+    url='https://html.duckduckgo.com/html/?'+urllib.parse.urlencode({'q':query})
+    doc=fetch(url,timeout=5)
+    parser=DuckResults();parser.feed(doc)
+    return parser.results[:14]
+
+def bing_rss(query):
+    url='https://www.bing.com/search?'+urllib.parse.urlencode({'q':query,'format':'rss'})
+    root=ET.fromstring(fetch(url,timeout=6))
+    return [{'title':sanitize_text(e.findtext('title'),160),'url':clean_url(e.findtext('link')),
+             'snippet':sanitize_text(e.findtext('description'),450),'source':'Bing RSS'}
+            for e in root.findall('.//item') if clean_url(e.findtext('link'))][:16]
+
+def wiki_search(query,lang='fr'):
+    lang=lang if lang in ('fr','en','de','es','it','pt','ar','ru','ja','zh') else 'fr'
+    url=f'https://{lang}.wikipedia.org/w/api.php?'+urllib.parse.urlencode({'action':'query','list':'search','srsearch':query,'srlimit':7,'format':'json'})
+    data=json.loads(fetch(url,timeout=5))
+    return [{'title':sanitize_text(i.get('title'),160),'url':f'https://{lang}.wikipedia.org/wiki/'+urllib.parse.quote(i.get('title','').replace(' ','_')),
+             'snippet':sanitize_text(i.get('snippet'),400),'source':'Wikipédia'} for i in data.get('query',{}).get('search',[])]
+
+def search(query,lang='fr',limit=15):
+    query=(query or '').strip()[:180]
+    if not query:return {'query':'','results':[],'summary':'Saisis une recherche pour commencer.','providers':[]}
+    sources=[('Web',lambda:bing_rss(query)),('DuckDuckGo',lambda:ddg(query)),('Encyclopédie',lambda:wiki_search(query,lang))]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures=[pool.submit(fn) for _,fn in sources]
+        bundles=[]
+        for (name,_),f in zip(sources,futures):
+            try:bundles.append((name,f.result(timeout=7)))
+            except Exception:bundles.append((name,[]))
+    results=[]; seen=set()
+    # Interleave providers, rather than letting encyclopaedia fill the full list.
+    mx=max([len(arr) for _,arr in bundles]or[0])
+    for j in range(mx):
+        for _,arr in bundles:
+            if j>=len(arr):continue
+            item=arr[j];url=clean_url(item.get('url'))
+            key=url.split('#')[0].rstrip('/').lower()
+            if not key or key in seen:continue
+            seen.add(key);results.append({'title':sanitize_text(item.get('title'),160),'url':url,
+              'snippet':sanitize_text(item.get('snippet'),480),'source':str(item.get('source','Web'))})
+    results=results[:min(max(1,limit),MAX_RESULTS)]
+    first=next((r for r in results if len(r['snippet'])>=70), None)
+    summary=(f"{first['title']} : {first['snippet']}" if first else
+             'Les sources disponibles ne donnent pas encore de synthèse fiable pour cette recherche.')
+    return {'query':query,'results':results,'summary':summary,'providers':[name for name,rows in bundles if rows],
+            'answer_type':'extrait de sources, pas réponse générée par un LLM'}
+
+def images(query,limit=18):
+    query=(query or '').strip()[:160]
+    if not query:return {'query':'','results':[],'provider':'Wikimedia Commons'}
+    params={'action':'query','generator':'search','gsrsearch':query,'gsrnamespace':6,'gsrlimit':min(max(limit,1),30),
+            'prop':'imageinfo','iiprop':'url|extmetadata','iiurlwidth':420,'format':'json'}
+    url='https://commons.wikimedia.org/w/api.php?'+urllib.parse.urlencode(params)
+    try:data=json.loads(fetch(url,timeout=7))
+    except Exception:return {'query':query,'results':[],'provider':'Wikimedia Commons','error':'Recherche images momentanément indisponible'}
+    results=[]
+    for page in data.get('query',{}).get('pages',{}).values():
+        info=next(iter(page.get('imageinfo',[])),{});link=clean_url(info.get('thumburl',info.get('url','')))
+        full=clean_url(info.get('url',''));source=clean_url(info.get('descriptionurl',''))
+        if not link:continue
+        meta=info.get('extmetadata',{})
+        credit=sanitize_text(meta.get('Artist',{}).get('value',''),120)
+        license_name=sanitize_text(meta.get('LicenseShortName',{}).get('value',''),60)
+        results.append({'title':str(page.get('title','')).removeprefix('File:')[:130],
+          'thumbnail':link,'image_url':full,'source_url':source,'credit':credit,'license':license_name})
+    return {'query':query,'results':results[:limit],'provider':'Wikimedia Commons'}
+
+class BodyText(HTMLParser):
+    def __init__(self):super().__init__();self.parts=[];self.title='';self.inside_ignore=0;self.in_title=False
+    def handle_starttag(self,tag,attrs):
+        if tag in ('script','style','nav','footer','header','noscript'):self.inside_ignore+=1
+        if tag=='title':self.in_title=True
+    def handle_endtag(self,tag):
+        if tag in ('script','style','nav','footer','header','noscript'):self.inside_ignore=max(0,self.inside_ignore-1)
+        if tag=='title':self.in_title=False
+    def handle_data(self,data):
+        if self.in_title:self.title+=data
+        elif self.inside_ignore==0 and len(data.strip())>45 and len(self.parts)<90:self.parts.append(data.strip())
+
+def assert_public_host(url):
+    parsed=urllib.parse.urlsplit(url)
+    if parsed.scheme!='https' or not parsed.hostname or parsed.port not in (None,443):raise ValueError('Seules les pages HTTPS publiques sont analysées')
+    host=parsed.hostname
+    if host.lower() in ('localhost','localhost.localdomain') or host.endswith('.local'):raise ValueError('Adresse locale non autorisée')
+    try:
+        for ans in socket.getaddrinfo(host,parsed.port or 443,type=socket.SOCK_STREAM):
+            addr=ipaddress.ip_address(ans[4][0]);
+            if not addr.is_global:raise ValueError('Adresse privée non autorisée')
+    except socket.gaierror:raise ValueError('Domaine introuvable')
+    return url
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,*args,**kwargs):raise ValueError('Redirection externe refusée pour sécurité')
+
+def analyze_page(url):
+    assert_public_host(url)
+    req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'text/html'})
+    with urllib.request.build_opener(NoRedirect()).open(req,timeout=7) as r:
+        ctype=r.headers.get('Content-Type','').lower()
+        if not 'text/html' in ctype:raise ValueError('Seules les pages HTML publiques sont analysées')
+        doc=r.read(550000).decode('utf-8','replace')
+    parser=BodyText();parser.feed(doc)
+    paragraphs=[sanitize_text(p,600) for p in parser.parts if len(p)>40]
+    return {'title':sanitize_text(parser.title,150),'url':url,'summary':' '.join(paragraphs[:3])[:1500],
+            'paragraphs':paragraphs[:12],'note':'Extraction de texte public, sans prétendre comprendre les pages comme un LLM.'}
+
+# END dura_search.py
+
+# BEGIN dura_art.py
+"""Procedural image art engine; genuinely generates PNGs locally, not diffusion/photos.
+Optional privately-hosted AUTOMATIC1111 /sdapi/v1/txt2img for neural images.
+"""
+import base64, colorsys, hashlib, io, json, math, os, random, textwrap, urllib.request
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+def font(size):
+    for name in ('DejaVuSans-Bold.ttf','C:/Windows/Fonts/seguibl.ttf','/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'):
+        try:return ImageFont.truetype(name,size)
+        except OSError:pass
+    return ImageFont.load_default()
+
+def procedural_image(prompt,width=1024,height=576):
+    width=min(max(int(width),320),1400);height=min(max(int(height),320),1000)
+    prompt=str(prompt or 'Dura').strip()[:220]
+    seed=int.from_bytes(hashlib.sha256(prompt.encode()).digest()[:8],'big');r=random.Random(seed)
+    hue=r.random();rgb=lambda hh,ss,ll:tuple(int(255*c) for c in colorsys.hls_to_rgb(hh%1,ll,ss))
+    base=rgb(hue,.70,.12); accent=rgb(hue+.16,.88,.58); second=rgb(hue+.35,.83,.55)
+    im=Image.new('RGB',(width,height));pix=im.load()
+    for y in range(height):
+        t=y/max(height-1,1);v=.05+.14*t
+        for x in range(width):
+            light=.04*(x/max(width,1))
+            pix[x,y]=tuple(min(255,int(base[i]*(1-t*.30)+accent[i]*(v+light))) for i in range(3))
+    layer=Image.new('RGBA',im.size,(0,0,0,0));d=ImageDraw.Draw(layer,'RGBA')
+    for j in range(45):
+        x=r.randint(-200,width+200);y=r.randint(-180,height+180);sz=r.randint(10,230)
+        clr=accent if j%2 else second
+        d.ellipse((x-sz,y-sz,x+sz,y+sz),fill=(clr[0],clr[1],clr[2],r.randint(6,34)))
+    blur=layer.filter(ImageFilter.GaussianBlur(25));im=Image.alpha_composite(im.convert('RGBA'),blur)
+    overlay=Image.new('RGBA',im.size,(0,0,0,0));d=ImageDraw.Draw(overlay,'RGBA')
+    for i in range(14):
+        x=r.randrange(width);y=r.randrange(height);size=r.randrange(25,190)
+        d.rounded_rectangle((x,y,x+size,y+size),radius=min(24,size//4),outline=(*second,105),width=2)
+    d.rounded_rectangle((int(width*.055),int(height*.12),int(width*.945),int(height*.89)),radius=32,fill=(4,8,18,110),outline=(*accent,155),width=2)
+    title=prompt[:65].strip(); lines=textwrap.wrap(title,width=max(16,width//39))[:3]
+    f=font(min(70,max(27,width//17)));big=font(17)
+    lh=min(93,max(44,height//7)); start=int(height*.44)-(len(lines)*lh//2)
+    for idx,line in enumerate(lines):
+        bbox=d.textbbox((0,0),line,font=f);tw=bbox[2]-bbox[0]
+        d.text(((width-tw)//2,start+idx*lh),line,font=f,fill=(255,255,255,250),stroke_width=1,stroke_fill=(10,15,29,190))
+    d.text((int(width*.075),int(height*.81)),'DURA • ORIGINAL GENERATIVE ART',font=big,fill=(213,226,255,185))
+    im=Image.alpha_composite(im,overlay).convert('RGB');out=io.BytesIO();im.save(out,format='PNG',optimize=True)
+    return out.getvalue()
+
+def render_image(prompt,mode='illustration'):
+    if mode=='diffusion':
+        endpoint=os.getenv('DURA_IMAGE_MODEL_URL','').strip().rstrip('/')
+        if not endpoint:raise RuntimeError('Génération neuronale non configurée : ajoute ton serveur GPU dans DURA_IMAGE_MODEL_URL.')
+        # This URL is operator configured, not provided by the user.
+        if not endpoint.startswith(('https://','http://')):raise ValueError('Adresse du générateur invalide')
+        data=json.dumps({'prompt':str(prompt)[:500],'steps':24,'width':768,'height':512,'batch_size':1}).encode('utf-8')
+        req=urllib.request.Request(endpoint+'/sdapi/v1/txt2img',data=data,headers={'Content-Type':'application/json'},method='POST')
+        with urllib.request.urlopen(req,timeout=110) as r:response=json.load(r)
+        raw=(response.get('images') or [''])[0]
+        if not raw:raise RuntimeError('Le serveur image n’a rien généré')
+        decoded=base64.b64decode(raw.split(',')[-1],validate=True)
+        if len(decoded)>12_000_000:raise ValueError('Image trop volumineuse')
+        return decoded,'diffusion locale'
+    return procedural_image(prompt),'illustration procédurale'
+
+# END dura_art.py
+
+# BEGIN v7_endpoints.py
+# Dura ORBIT search, image studio, and grounded DuraIA reply endpoints.
+from fastapi import Query, Request
+from fastapi.responses import JSONResponse
+from functools import lru_cache as _v7_cache
+
+import base64 as _v7_b64
+import threading as _v7_threading
+import time as _v7_time
+
+app.version='7.0'
+_v7_public_calls={}
+_v7_public_lock=_v7_threading.Lock() if '_v7_threading' in globals() else None
+
+def _v7_throttle_public(request:Request):
+    # Short in-memory limit for the free server. Reverse proxy IPs may be shared;
+    # production should replace this with Redis / edge limits.
+    import time
+    ip=(request.client.host if request.client else 'unknown')
+    now=time.monotonic()
+    with _v7_public_lock:
+        events=[t for t in _v7_public_calls.get(ip,[]) if now-t<60]
+        if len(events)>=36:raise HTTPException(429,'Trop de recherches en une minute. Réessaie plus tard.')
+        events.append(now)
+        _v7_public_calls[ip]=events
+        if len(_v7_public_calls)>2000:
+            for key in list(_v7_public_calls)[:500]:_v7_public_calls.pop(key,None)
+
+@_v7_cache(maxsize=300)
+def _v7_cached_search(q,lang,limit,time_bucket):return search(q,lang,limit)
+@_v7_cache(maxsize=180)
+def _v7_cached_images(q,limit,time_bucket):return images(q,limit)
+
+_dura_art_clock={}
+_dura_art_lock=_v7_threading.Lock()
+
+@app.get('/v7/search')
+def v7_web_search(q:str=Query(min_length=1,max_length=180),lang:str='fr',limit:int=15,request:Request=None):
+    if request is not None:_v7_throttle_public(request)
+    return _v7_cached_search(q,lang,limit,int(_v7_time.time()//180))
+
+@app.get('/v7/search/images')
+def v7_web_images(q:str=Query(min_length=1,max_length=160),limit:int=18,request:Request=None):
+    if request is not None:_v7_throttle_public(request)
+    return _v7_cached_images(q,min(max(limit,1),24),int(_v7_time.time()//600))
+
+class DuraPageBody(BaseModel):
+    url:str=Field(min_length=8,max_length=2048)
+
+@app.post('/v7/search/analyze')
+def v7_page_analyze(data:DuraPageBody):
+    try:return analyze_page(data.url)
+    except (ValueError,urllib.error.URLError,TimeoutError) as exc:raise HTTPException(400,str(exc))
+
+class DuraImageRequest(BaseModel):
+    prompt:str=Field(min_length=3,max_length=500)
+    mode:str='illustration'
+
+@app.post('/v7/ai/image')
+def v7_ai_image(x:DuraImageRequest,u:User=Depends(me),d:Session=Depends(db)):
+    ai_verified(u,d)
+    if x.mode not in ('illustration','diffusion'):raise HTTPException(400,'Mode image inconnu')
+    with _dura_art_lock:
+        now=_v7_time.monotonic();last=_dura_art_clock.get(u.id,0)
+        if now-last<8:raise HTTPException(429,'Attends huit secondes entre deux générations d’images.')
+        _dura_art_clock[u.id]=now
+    try:raw,engine_name=render_image(x.prompt,mode=x.mode)
+    except (RuntimeError,ValueError) as exc:raise HTTPException(503,str(exc))
+    except Exception:
+        logger.exception('Dura image generation failed')
+        raise HTTPException(503,'Générateur temporairement indisponible')
+    return {'mime_type':'image/png','image_base64':_v7_b64.b64encode(raw).decode('ascii'),
+            'prompt':x.prompt,'engine':engine_name,'is_neural':x.mode=='diffusion'}
+
+@app.get('/v7/ai/status')
+def v7_ai_status(u:User=Depends(me),d:Session=Depends(db)):
+    status=v50_ai_status(u,d)
+    status['version']='DuraIA 7.0 ORBIT'
+    status['image_procedural']=True
+    status['image_neural_configured']=bool(os.getenv('DURA_IMAGE_MODEL_URL','').strip())
+    status['public_image_search']=True
+    status['web_search']='DuraWeb (résultats publics cités)'
+    return status
+
+@app.post('/v7/ai/chat')
+def v7_ai_chat(x:AiChat,u:User=Depends(me),d:Session=Depends(db)):
+    raw=x.message.strip()
+    low=raw.lower()
+    # If a real self-hosted language model exists or user requests deterministic operations,
+    # the existing safe account / memory / conversation pipeline is reused.
+    deterministic=bool(DURA_MODEL_URL) or bool(re.search(r'\d\s*[+\-*/^%]\s*\d',low))
+    deterministic=deterministic or low.startswith(('bonjour','salut','hello','hi','retiens que','résume ','resume ',
+                   'corrige ','reformule ','calcule ','rédige ','redige ','écris ','ecris ','mes mails',
+                   'mes stats','combien de mails','que sais-tu','quel est mon compte'))
+    if deterministic or not x.web:
+        return v50_ai_chat(x,u,d)
+    # Grounded short evidence instead of concatenated irrelevant encyclopaedia paragraphs.
+    web_result=search(raw,lang=x.language if x.language!='auto' else 'fr',limit=7)
+    ranked=[r for r in web_result['results'] if len(r.get('snippet',''))>55]
+    # Prefer a source that actually discusses the user query, not the first random result.
+    terms=[t for t in re.findall(r'[\wÀ-ÿ]{3,}',low) if t not in {'quelle','quel','quels','quelles','est','sont','dans','pour','avec','comment','pourquoi','the','are','what','where','which','quand','cette','celui','une','des','les','qui','que','sur','and','from'}]
+    def relevance(item):
+        title=item.get('title','').lower();body=item.get('snippet','').lower()
+        return sum(3*(term in title)+(term in body) for term in terms) + (1 if item.get('source')=='Wikipédia' else 0)
+    ranked.sort(key=relevance,reverse=True)
+    if ranked and (not terms or relevance(ranked[0])>=1):
+        top=ranked[0]
+        answer=(f"Selon {top['source']}, {top['snippet']}")[:650]
+        if len(ranked)>1 and ranked[1]['source']!=top['source']:
+            answer+='\n\nAutre résultat : '+ranked[1]['snippet'][:320]
+        answer+='\n\nSources :\n'+'\n'.join(f"• {r['title']} : {r['url']}" for r in ranked[:3])
+    else:
+        answer=('Je n’ai pas trouvé assez de sources publiques fiables pour répondre précisément à cette question. '
+                'Essaie une recherche DuraWeb plus ciblée ou active un modèle neuronal local pour des réponses rédigées.')
+    c=d.get(AiConversation,x.conversation_id) if x.conversation_id else None
+    if not c or c.user_id!=u.id:
+        c=AiConversation(user_id=u.id,title=raw[:60] or 'Recherche');d.add(c);d.commit();d.refresh(c)
+    d.add(AiMessage(conversation_id=c.id,role='user',content=raw))
+    d.add(AiMessage(conversation_id=c.id,role='assistant',content=answer))
+    c.updated_at=datetime.utcnow();d.commit()
+    return {'conversation_id':c.id,'text':answer,'engine':'Recherche DuraWeb — extraits cités (pas LLM)',
+            'sources':[{'title':r['title'],'url':r['url']} for r in ranked[:3]],'language':x.language}
+
+@app.get('/v7/system')
+def v7_system():
+    return {'name':'Dura Ecosystem','version':'7.0','services':['DuraTube','DuraTube Studio','DuraMail','DuraIA','DuraWeb','DuraMR'],
+            'browser_engine':'QtWebEngine / Chromium côté Windows',
+            'search_engine':'méta-recherche web public','image_mode':'génération procédurale; diffusion optionnelle GPU'}
+
+# END v7_endpoints.py
+
+class DuraImageExplainRequest(BaseModel):
+    image_url:str=Field(min_length=10,max_length=2000)
+    title:str=Field(default='',max_length=140)
+    license:str=Field(default='',max_length=140)
+    credit:str=Field(default='',max_length=140)
+
+@app.post('/v7/images/explain')
+def v7_images_explain(x:DuraImageExplainRequest):
+    # Only Commons file servers. User-chosen arbitrary URLs would allow SSRF.
+    parsed=urllib.parse.urlsplit(x.image_url)
+    if parsed.scheme!='https' or parsed.hostname not in ('upload.wikimedia.org','commons.wikimedia.org'):
+        raise HTTPException(400,'Analyse limitée aux images Wikimedia Commons publiques.')
+    basic=(f"Fichier : {x.title or 'Sans titre'}. "
+           f"Auteur / source : {x.credit or 'Non indiqué'}. "
+           f"Licence indiquée : {x.license or 'À vérifier sur Wikimedia Commons'}.")
+    url=DURA_MODEL_URL
+    vision_model=os.getenv('DURA_VISION_MODEL_NAME','').strip()
+    if not url or not vision_model:
+        return {'description':basic+' L’analyse de ce que représente réellement l’image nécessite un modèle de vision auto-hébergé.',
+                'model_used':False,'metadata_only':True}
+    try:
+        # No redirects, strict size/type. Model URL is managed by server operator.
+        req=urllib.request.Request(x.image_url,headers={'User-Agent':'DuraVision/7.0'})
+        with urllib.request.build_opener(NoRedirect()).open(req,timeout=8) as resp:
+            if resp.headers.get('Content-Type','').split(';')[0].lower() not in ('image/jpeg','image/png','image/webp'):
+                raise ValueError('Format d’image non pris en charge')
+            photo=resp.read(4_000_001)
+            if len(photo)>4_000_000:raise ValueError('Image trop volumineuse pour être analysée')
+        data={'model':vision_model,'stream':False,'messages':[{'role':'user',
+              'content':'Décris objectivement cette image en français. Ne devine pas les identités ni les faits invisibles.',
+              'images':[_v7_b64.b64encode(photo).decode('ascii')]}]}
+        post=urllib.request.Request(url+'/api/chat',method='POST',
+                                    headers={'Content-Type':'application/json'},data=json.dumps(data).encode('utf-8'))
+        with urllib.request.urlopen(post,timeout=80) as r:answer=json.load(r)
+        description=str(answer.get('message',{}).get('content','')).strip()[:3200]
+        if not description:raise ValueError('Aucune description du modèle')
+        return {'description':description+'\n\n'+basic,'model_used':True,'metadata_only':False}
+    except Exception:
+        logger.exception('DuraVision provider unavailable')
+        return {'description':basic+' Le modèle visuel est actuellement indisponible.',
+                'model_used':False,'metadata_only':True}
