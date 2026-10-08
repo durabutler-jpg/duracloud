@@ -216,9 +216,9 @@ def bootstrap():
 
 @app.get("/")
 def status():
-    return {"service":"Dura Cloud","version":"7.0","status":"online" if DATABASE_READY else "degraded",
-            "release":"orbit-desktop-candidate","duratube":True,"studio":True,"duramail":True,
-            "duraia":"DuraBrain 7.0","duraweb":True,"duramr":True,"database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
+    return {"service":"Dura Cloud","version":"8.0","status":"online" if DATABASE_READY else "degraded",
+            "release":"foundation-beta","duratube":True,"studio":True,"duramail":True,
+            "duraia":"DuraBrain 8.0 (outils + modèle optionnel)","duraweb":True,"duramr":True,"duramaps":True,"database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
             "warnings":CONFIG_WARNINGS}
 
 @app.get("/health")
@@ -233,13 +233,13 @@ def health():
     r2_cfg=bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET)
     secret_persistent=bool(os.getenv("DURA_SECRET","").strip())
     return {"ok":db_ok,"database":db_ok,"r2_configured":r2_cfg,"secret_persistent":secret_persistent,
-            "warnings":CONFIG_WARNINGS,"version":"7.0"}
+            "warnings":CONFIG_WARNINGS,"version":"8.0"}
 
 @app.get("/ready")
 def ready():
     if not DATABASE_READY:
         raise HTTPException(503,"Dura Cloud démarre mais la base de données n'est pas prête. Consulte /health et les logs Render.")
-    return {"ready":True,"version":"7.0"}
+    return {"ready":True,"version":"8.0"}
 
 @app.patch("/account/profile")
 def update_profile(x:ProfileIn,u:User=Depends(me),d:Session=Depends(db)):
@@ -287,7 +287,7 @@ def bootstrap_payload(u:User=Depends(me),d:Session=Depends(db)):
     if u.channel_name:
         p=d.query(ChannelProfile).filter_by(user_id=u.id).first() or ChannelProfile(user_id=u.id)
         channel_data={"name":u.channel_name,"description":p.description or "","subscribers":d.query(Subscription).filter_by(channel_id=u.id).count(),"videos":d.query(Video).filter_by(owner_id=u.id,status="published").count()}
-    return {"user":pub_user(u),"unread":unread,"theme":{k:getattr(t,k) for k in ["accent","background","surface","text","font","radius","density","graphic"]},"channel":channel_data,"version":"7.0"}
+    return {"user":pub_user(u),"unread":unread,"theme":{k:getattr(t,k) for k in ["accent","background","surface","text","font","radius","density","graphic"]},"channel":channel_data,"version":"8.0"}
 
 @app.get("/theme/me")
 def theme_me(u:User=Depends(me),d:Session=Depends(db)):
@@ -2257,7 +2257,7 @@ import base64 as _v7_b64
 import threading as _v7_threading
 import time as _v7_time
 
-app.version='7.0'
+app.version='8.0'
 _v7_public_calls={}
 _v7_public_lock=_v7_threading.Lock() if '_v7_threading' in globals() else None
 
@@ -2334,7 +2334,25 @@ def v7_ai_status(u:User=Depends(me),d:Session=Depends(db)):
 @app.post('/v7/ai/chat')
 def v7_ai_chat(x:AiChat,u:User=Depends(me),d:Session=Depends(db)):
     raw=x.message.strip()
-    low=raw.lower()
+    low=raw.lower().strip().rstrip('!?. ')
+    # Conversational acknowledgements must never trigger an unrelated web search.
+    smalltalk={
+        'ok':'Compris. Tu peux continuer.', 'okay':'Compris. Tu peux continuer.',
+        'd’accord':'Entendu.', 'daccord':'Entendu.', 'oui':'Oui, je t’écoute.',
+        'non':'D’accord. Tu peux préciser ce que tu veux changer.',
+        'merci':'Avec plaisir.', 'merci beaucoup':'Avec plaisir.',
+        'thanks':'You’re welcome.', 'thank you':'You’re welcome.',
+        'salut':'Salut ! Que veux-tu faire ?', 'hello':'Hello! How can I help?',
+        'bonjour':'Bonjour ! Que veux-tu faire ?'
+    }
+    if low in smalltalk:
+        c=d.get(AiConversation,x.conversation_id) if x.conversation_id else None
+        if not c or c.user_id!=u.id:
+            c=AiConversation(user_id=u.id,title=raw[:60]);d.add(c);d.commit();d.refresh(c)
+        d.add(AiMessage(conversation_id=c.id,role='user',content=raw))
+        d.add(AiMessage(conversation_id=c.id,role='assistant',content=smalltalk[low]))
+        c.updated_at=datetime.utcnow();d.commit()
+        return {'conversation_id':c.id,'text':smalltalk[low], 'engine':'conversation courte'}
     # If a real self-hosted language model exists or user requests deterministic operations,
     # the existing safe account / memory / conversation pipeline is reused.
     deterministic=bool(DURA_MODEL_URL) or bool(re.search(r'\d\s*[+\-*/^%]\s*\d',low))
@@ -2419,3 +2437,108 @@ def v7_images_explain(x:DuraImageExplainRequest):
         logger.exception('DuraVision provider unavailable')
         return {'description':basic+' Le modèle visuel est actuellement indisponible.',
                 'model_used':False,'metadata_only':True}
+
+
+# BEGIN DuraMaps v8
+"""DuraMaps v8: account-scoped saved places and conservative OpenStreetMap geocoding.
+
+Use with the single-file cloud server, appended after all existing entities and routes.
+The public Nominatim service is demonstration-only, with cache and throttle; production
+must use a hosted geocoder with published terms and capacity.
+"""
+from fastapi import Query as MapQuery
+from pydantic import BaseModel as MapBaseModel, Field as MapField
+from sqlalchemy import Float as MapFloat
+from threading import Lock as MapLock
+from time import monotonic as map_monotonic
+from urllib.parse import urlencode as map_urlencode
+
+class MapFavorite(Base):
+    __tablename__ = 'map_favorites'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    name = Column(String(120), nullable=False)
+    address = Column(String(350), nullable=False)
+    latitude = Column(MapFloat, nullable=False)
+    longitude = Column(MapFloat, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class MapFavoriteRequest(MapBaseModel):
+    name: str = MapField(min_length=1, max_length=120)
+    address: str = MapField(min_length=1, max_length=350)
+    latitude: float = MapField(ge=-90, le=90)
+    longitude: float = MapField(ge=-180, le=180)
+
+_map_cache = {}
+_map_lock = MapLock()
+_map_next_request = 0.0
+
+def _as_place(place):
+    return {'id': place.id, 'name': place.name, 'address': place.address,
+            'latitude': place.latitude, 'longitude': place.longitude}
+
+@app.get('/v8/maps/status')
+def v8_maps_status(u:User=Depends(me)):
+    return {'maps': True, 'account': u.address, 'geocoder': 'OpenStreetMap Nominatim (prototype)',
+            'tiles': 'OpenStreetMap', 'routes': 'OpenStreetMap directions', 'favorites': True,
+            'notice': 'Geocoding en ligne: les recherches de lieux sont transmises au fournisseur public.'}
+
+@app.get('/v8/maps/search')
+def v8_maps_search(q:str=MapQuery(min_length=2,max_length=160),u:User=Depends(me)):
+    global _map_next_request
+    name=' '.join(q.strip().split())
+    if len(name)<2:raise HTTPException(400,'Indique une adresse ou un lieu.')
+    key=name.casefold();now=map_monotonic()
+    with _map_lock:
+        item=_map_cache.get(key)
+        if item and now-item[0]<3600:
+            return {'query':name,'places':item[1], 'cached':True}
+        if now<_map_next_request:
+            raise HTTPException(429,'Recherche trop rapide : réessaie dans quelques secondes.')
+        _map_next_request=now+1.2
+    params=map_urlencode({'q':name,'format':'jsonv2','limit':8,'addressdetails':0})
+    endpoint=os.getenv('DURA_MAPS_GEOCODER','https://nominatim.openstreetmap.org/search').strip()
+    if endpoint!='https://nominatim.openstreetmap.org/search' and not endpoint.startswith('https://'):
+        raise HTTPException(503,'Fournisseur de carte invalide.')
+    contact=os.getenv('DURA_MAPS_CONTACT','').strip()[:100]
+    ua=f'DuraMaps/8.0 (DuraIndustry; {contact or "desktop-prototype"})'
+    request=urllib.request.Request(endpoint+'?'+params,headers={'User-Agent':ua,'Accept':'application/json'})
+    try:
+        with urllib.request.urlopen(request,timeout=8) as response:
+            data=json.loads(response.read(100_000))
+    except Exception:
+        raise HTTPException(503,'Service de recherche d’adresses momentanément indisponible.')
+    result=[]
+    for p in data[:8] if isinstance(data,list) else []:
+        try:
+            lat=float(p['lat']);lon=float(p['lon'])
+            if not -90<=lat<=90 or not -180<=lon<=180:continue
+            result.append({'name':str(p.get('name') or p.get('display_name','')).strip()[:120],
+                'address':str(p.get('display_name',''))[:350], 'latitude':lat,'longitude':lon,
+                'type':str(p.get('type',''))[:40]})
+        except (ValueError,KeyError,TypeError):pass
+    with _map_lock:
+        if len(_map_cache)>250:_map_cache.clear()
+        _map_cache[key]=(map_monotonic(),result)
+    return {'query':name,'places':result,'cached':False}
+
+@app.get('/v8/maps/favorites')
+def v8_maps_favorites(u:User=Depends(me),d:Session=Depends(db)):
+    return [_as_place(p) for p in d.query(MapFavorite).filter_by(user_id=u.id).order_by(MapFavorite.id.desc()).limit(120).all()]
+
+@app.post('/v8/maps/favorites',status_code=201)
+def v8_maps_favorite_add(data:MapFavoriteRequest,u:User=Depends(me),d:Session=Depends(db)):
+    count=d.query(MapFavorite).filter_by(user_id=u.id).count()
+    if count>=120:raise HTTPException(400,'Maximum 120 lieux favoris par compte.')
+    existing=d.query(MapFavorite).filter_by(user_id=u.id,latitude=data.latitude,longitude=data.longitude).first()
+    if existing:return _as_place(existing)
+    f=MapFavorite(user_id=u.id,name=data.name.strip(),address=data.address.strip(),latitude=data.latitude,longitude=data.longitude)
+    d.add(f);d.commit();d.refresh(f);return _as_place(f)
+
+@app.delete('/v8/maps/favorites/{favorite_id}')
+def v8_maps_favorite_delete(favorite_id:int,u:User=Depends(me),d:Session=Depends(db)):
+    f=d.query(MapFavorite).filter_by(id=favorite_id,user_id=u.id).first()
+    if not f:raise HTTPException(404,'Lieu favori introuvable.')
+    d.delete(f);d.commit();return {'deleted':True}
+
+# END DuraMaps v8
