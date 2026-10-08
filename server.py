@@ -1,4 +1,6 @@
-import os, uuid, jwt, boto3, random, hashlib, ast, math, re, html, secrets, logging, json
+import os, uuid, jwt, boto3, random, hashlib, ast, math, re, html, secrets, logging, json, socket, ipaddress
+import urllib.request, urllib.parse, urllib.error
+import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -122,7 +124,7 @@ class Report(Base):
     __tablename__="reports"
     id=Column(Integer,primary_key=True); reporter_id=Column(Integer,ForeignKey("users.id"),nullable=False); target_type=Column(String(30),nullable=False); target_id=Column(Integer,nullable=False); reason=Column(String(300),default=""); status=Column(String(30),default="open"); created_at=Column(DateTime,default=datetime.utcnow)
 
-app=FastAPI(title="Dura Cloud",version="4.5")
+app=FastAPI(title="Dura Cloud",version="5.0")
 app.add_middleware(GZipMiddleware, minimum_size=700)
 
 def db():
@@ -166,6 +168,8 @@ class AiVerify(BaseModel):code:str
 class AiChat(BaseModel):
     message:str=Field(min_length=1,max_length=12000)
     conversation_id:Optional[int]=None
+    web:bool=True
+    language:Optional[str]="auto"
 class AiConversationIn(BaseModel):title:str="Nouvelle conversation"
 class AiMemoryIn(BaseModel):key:str=Field(min_length=1,max_length=80);value:str=Field(min_length=1,max_length=4000)
 class ProfileIn(BaseModel):display_name:str=Field(min_length=2,max_length=80)
@@ -212,9 +216,9 @@ def bootstrap():
 
 @app.get("/")
 def status():
-    return {"service":"Dura Cloud","version":"4.5","status":"online" if DATABASE_READY else "degraded",
-            "release":"titan-desktop-candidate","duratube":True,"studio":True,"duramail":True,
-            "duraia":"DuraBrain Core 3.5","database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
+    return {"service":"Dura Cloud","version":"5.0","status":"online" if DATABASE_READY else "degraded",
+            "release":"nova-public-candidate","duratube":True,"studio":True,"duramail":True,
+            "duraia":"DuraBrain Core 5.0","database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
             "warnings":CONFIG_WARNINGS}
 
 @app.get("/health")
@@ -229,13 +233,13 @@ def health():
     r2_cfg=bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET)
     secret_persistent=bool(os.getenv("DURA_SECRET","").strip())
     return {"ok":db_ok,"database":db_ok,"r2_configured":r2_cfg,"secret_persistent":secret_persistent,
-            "warnings":CONFIG_WARNINGS,"version":"4.5"}
+            "warnings":CONFIG_WARNINGS,"version":"5.0"}
 
 @app.get("/ready")
 def ready():
     if not DATABASE_READY:
         raise HTTPException(503,"Dura Cloud démarre mais la base de données n'est pas prête. Consulte /health et les logs Render.")
-    return {"ready":True,"version":"4.5"}
+    return {"ready":True,"version":"5.0"}
 
 @app.patch("/account/profile")
 def update_profile(x:ProfileIn,u:User=Depends(me),d:Session=Depends(db)):
@@ -283,7 +287,7 @@ def bootstrap_payload(u:User=Depends(me),d:Session=Depends(db)):
     if u.channel_name:
         p=d.query(ChannelProfile).filter_by(user_id=u.id).first() or ChannelProfile(user_id=u.id)
         channel_data={"name":u.channel_name,"description":p.description or "","subscribers":d.query(Subscription).filter_by(channel_id=u.id).count(),"videos":d.query(Video).filter_by(owner_id=u.id,status="published").count()}
-    return {"user":pub_user(u),"unread":unread,"theme":{k:getattr(t,k) for k in ["accent","background","surface","text","font","radius","density","graphic"]},"channel":channel_data,"version":"4.5"}
+    return {"user":pub_user(u),"unread":unread,"theme":{k:getattr(t,k) for k in ["accent","background","surface","text","font","radius","density","graphic"]},"channel":channel_data,"version":"5.0"}
 
 @app.get("/theme/me")
 def theme_me(u:User=Depends(me),d:Session=Depends(db)):
@@ -948,7 +952,7 @@ def v45_bootstrap(u: User = Depends(me), d: Session = Depends(db)):
     pending = d.query(CreatorVerification).filter_by(user_id=u.id, status="pending").order_by(CreatorVerification.id.desc()).first()
     unread = d.query(Mail).filter(Mail.recipient_id == u.id, Mail.trash_recipient == False, Mail.is_read == False).count()
     return {
-        "version": "4.5",
+        "version": "5.0",
         "user": pub_user(u) | {"verified": bool(u.is_official)},
         "unread": unread,
         "official_channel_id": official.id if official else None,
@@ -1623,3 +1627,344 @@ def v45_ai_chat(x: AiChat, u: User = Depends(me), d: Session = Depends(db)):
     c.updated_at = datetime.utcnow()
     d.commit()
     return {"text": answer, "conversation_id": c.id, "engine": "DuraBrain Core 3.5"}
+
+
+# ============================================================
+# DuraBrain Core 5.0 - NOVA public-web research layer
+# No commercial AI API/key is used. This layer combines local tools,
+# multilingual public knowledge and a guarded public-web retriever.
+# ============================================================
+
+class DuraBrainWeb5:
+    LANG_HINTS = {
+        "fr": {"bonjour","pourquoi","comment","quelle","quel","avec","dans","est","une","des","les","je","tu","ça","ca"},
+        "en": {"hello","why","how","what","which","with","the","is","are","and","you","i"},
+        "es": {"hola","por qué","porque","cómo","como","qué","que","con","una","los","las","es"},
+        "de": {"hallo","warum","wie","was","welche","mit","und","ist","die","der","das"},
+        "it": {"ciao","perché","perche","come","cosa","quale","con","una","gli","le","è"},
+        "pt": {"olá","ola","por que","como","qual","com","uma","os","as","é"},
+    }
+    WIKI_LANGS = {"fr","en","es","de","it","pt","nl","pl","ru","ar","tr","ja","ko","zh","sv","uk","cs","ro","id"}
+
+    def __init__(self):
+        self.ua = "DuraIA-NOVA/5.0 (+https://duracloud.onrender.com)"
+
+    def detect_language(self, text):
+        t=(text or "").strip().lower()
+        if re.search(r"[\u0600-\u06ff]",t): return "ar"
+        if re.search(r"[\u0400-\u04ff]",t): return "ru"
+        if re.search(r"[\u3040-\u30ff]",t): return "ja"
+        if re.search(r"[\uac00-\ud7af]",t): return "ko"
+        if re.search(r"[\u4e00-\u9fff]",t): return "zh"
+        words=set(re.findall(r"[a-zà-ÿ']+",t))
+        scores={lang:len(words & hints) for lang,hints in self.LANG_HINTS.items()}
+        best=max(scores,key=scores.get) if scores else "fr"
+        if scores.get(best,0)==0:
+            if any(c in t for c in "éèêàùçôîïâœ"): return "fr"
+            return "en" if re.search(r"\b(the|this|that|who|where|when)\b",t) else "fr"
+        return best
+
+    def _public_host(self, host):
+        if not host: return False
+        h=host.lower().strip('.')
+        if h in {"localhost","localhost.localdomain"}: return False
+        try:
+            infos=socket.getaddrinfo(h,None)
+            for info in infos:
+                ip=ipaddress.ip_address(info[4][0])
+                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                    return False
+        except Exception:
+            return False
+        return True
+
+    def get(self,url,timeout=7,max_bytes=700000):
+        try:
+            u=urllib.parse.urlparse(url)
+            if u.scheme not in {"http","https"} or not self._public_host(u.hostname): return None
+            req=urllib.request.Request(url,headers={"User-Agent":self.ua,"Accept-Language":"fr,en;q=0.8,*;q=0.5"})
+            with urllib.request.urlopen(req,timeout=timeout) as r:
+                ctype=(r.headers.get("Content-Type") or "").lower()
+                if not any(x in ctype for x in ("text/","application/json","application/xml","rss","atom")): return None
+                data=r.read(max_bytes+1)
+                if len(data)>max_bytes: data=data[:max_bytes]
+                enc="utf-8"
+                m=re.search(r"charset=([\w-]+)",ctype)
+                if m: enc=m.group(1)
+                return data.decode(enc,"replace")
+        except Exception:
+            return None
+
+    def strip_html(self,raw):
+        if not raw:return ""
+        raw=re.sub(r"(?is)<(script|style|noscript|svg).*?>.*?</\1>"," ",raw)
+        raw=re.sub(r"(?is)<br\s*/?>","\n",raw)
+        raw=re.sub(r"(?is)</(p|div|li|h[1-6])>","\n",raw)
+        raw=re.sub(r"(?s)<[^>]+>"," ",raw)
+        raw=html.unescape(raw)
+        raw=re.sub(r"[ \t]+"," ",raw)
+        raw=re.sub(r"\n\s*\n+","\n",raw)
+        return raw.strip()
+
+    def wiki(self,query,lang):
+        lang=lang if lang in self.WIKI_LANGS else "en"
+        base=f"https://{lang}.wikipedia.org/w/api.php"
+        params=urllib.parse.urlencode({"action":"query","list":"search","format":"json","utf8":1,"srlimit":4,"srsearch":query})
+        raw=self.get(base+"?"+params)
+        if not raw:return []
+        try: data=json.loads(raw)
+        except Exception:return []
+        out=[]
+        for item in data.get("query",{}).get("search",[])[:4]:
+            title=item.get("title","")
+            p=urllib.parse.urlencode({"action":"query","prop":"extracts","exintro":1,"explaintext":1,"format":"json","redirects":1,"titles":title})
+            detail=self.get(base+"?"+p)
+            extract=""
+            try:
+                dd=json.loads(detail or "{}")
+                pages=dd.get("query",{}).get("pages",{})
+                if pages: extract=next(iter(pages.values())).get("extract","")
+            except Exception:pass
+            if not extract: extract=self.strip_html(item.get("snippet",""))
+            if extract:
+                out.append({"title":title,"url":f"https://{lang}.wikipedia.org/wiki/"+urllib.parse.quote(title.replace(' ','_')),"text":extract,"source":"Wikipedia"})
+        return out
+
+    def wikidata(self,query,lang):
+        lang=lang if re.fullmatch(r"[a-z]{2,3}",lang or "") else "en"
+        url="https://www.wikidata.org/w/api.php?"+urllib.parse.urlencode({"action":"wbsearchentities","search":query,"language":lang,"uselang":lang,"format":"json","limit":5})
+        raw=self.get(url)
+        if not raw:return []
+        try:data=json.loads(raw)
+        except Exception:return []
+        out=[]
+        for x in data.get("search",[])[:5]:
+            desc=x.get("description") or ""
+            label=x.get("label") or x.get("id") or ""
+            if desc:out.append({"title":label,"url":x.get("concepturi") or ("https://www.wikidata.org/wiki/"+x.get("id","")),"text":f"{label}: {desc}","source":"Wikidata"})
+        return out
+
+    def ddg(self,query,lang):
+        # HTML search works without an API key. Failure simply falls back to other sources.
+        kl={"fr":"fr-fr","en":"us-en","es":"es-es","de":"de-de","it":"it-it","pt":"pt-pt"}.get(lang,"wt-wt")
+        url="https://html.duckduckgo.com/html/?"+urllib.parse.urlencode({"q":query,"kl":kl})
+        raw=self.get(url,timeout=8)
+        if not raw:return []
+        results=[]
+        pattern=re.compile(r'(?is)<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>')
+        for href,title,snip in pattern.findall(raw)[:8]:
+            title=self.strip_html(title); snip=self.strip_html(snip)
+            href=html.unescape(href)
+            if "uddg=" in href:
+                try:href=urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg",[href])[0]
+                except Exception:pass
+            if href.startswith("//"):href="https:"+href
+            if title and snip:results.append({"title":title,"url":href,"text":snip,"source":"Web"})
+        if results:return results
+        # Looser parser for DDG markup variants.
+        anchors=re.findall(r'(?is)<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',raw)
+        for href,title in anchors[:8]:
+            results.append({"title":self.strip_html(title),"url":html.unescape(href),"text":"","source":"Web"})
+        return results
+
+    def news(self,query,lang):
+        hl={"fr":"fr","en":"en-US","es":"es","de":"de","it":"it","pt":"pt-BR"}.get(lang,"en-US")
+        ceid={"fr":"FR:fr","en":"US:en","es":"ES:es","de":"DE:de","it":"IT:it","pt":"BR:pt-419"}.get(lang,"US:en")
+        url="https://news.google.com/rss/search?"+urllib.parse.urlencode({"q":query,"hl":hl,"ceid":ceid})
+        raw=self.get(url,timeout=8)
+        if not raw:return []
+        try:root=ET.fromstring(raw)
+        except Exception:return []
+        out=[]
+        for item in root.findall('.//item')[:6]:
+            title=(item.findtext('title') or '').strip(); link=(item.findtext('link') or '').strip(); desc=self.strip_html(item.findtext('description') or '')
+            if title:out.append({"title":title,"url":link,"text":desc or title,"source":"Actualités"})
+        return out
+
+    def stackexchange(self,query,lang):
+        if not re.search(r"\b(code|python|javascript|java|sql|api|fastapi|qt|pyside|c\+\+|bug|erreur|error|programming|programmation)\b",query.lower()):
+            return []
+        url="https://api.stackexchange.com/2.3/search/advanced?"+urllib.parse.urlencode({"order":"desc","sort":"relevance","q":query,"site":"stackoverflow","pagesize":5,"filter":"default"})
+        raw=self.get(url)
+        if not raw:return []
+        try:data=json.loads(raw)
+        except Exception:return []
+        out=[]
+        for x in data.get("items",[])[:5]:
+            title=html.unescape(x.get("title",'')); tags=', '.join(x.get('tags',[])[:5]); score=x.get('score',0)
+            out.append({"title":title,"url":x.get('link',''),"text":f"{title}. Tags: {tags}. Score: {score}.","source":"Stack Overflow"})
+        return out
+
+    def public_network_search(self,query,lang):
+        low=(query or '').lower()
+        domains={
+            'reddit':'reddit.com','github':'github.com','youtube':'youtube.com','tiktok':'tiktok.com',
+            'instagram':'instagram.com','facebook':'facebook.com','linkedin':'linkedin.com',
+            'twitter':'x.com',' x ':'x.com','stackoverflow':'stackoverflow.com'
+        }
+        selected=[]
+        for key,domain in domains.items():
+            if key in low and domain not in selected:selected.append(domain)
+        if any(x in low for x in ['réseaux sociaux','reseaux sociaux','social media','sur internet','on the internet']):
+            selected += [d for d in ['reddit.com','youtube.com','github.com','x.com'] if d not in selected]
+        out=[]
+        for domain in selected[:5]:
+            out.extend(self.ddg(f"{query} site:{domain}",lang)[:3])
+        return out
+
+    def extract_url(self,text):
+        m=re.search(r"https?://[^\s<>\]\)]+",text or "")
+        return m.group(0).rstrip('.,;!?') if m else None
+
+    def fetch_page(self,url):
+        raw=self.get(url,timeout=10,max_bytes=900000)
+        if not raw:return None
+        text=self.strip_html(raw)
+        # Keep meaningful chunks and remove navigation-heavy noise.
+        chunks=[x.strip() for x in re.split(r"\n+",text) if len(x.strip())>=45]
+        text=" ".join(chunks[:120])
+        return text[:45000] if text else None
+
+    def tokens(self,text):
+        return [x for x in re.findall(r"[\wÀ-ÿ'-]{2,}",(text or '').lower(),re.UNICODE) if x not in {"avec","pour","dans","this","that","from","have","what","when","where","which","your","vous","nous","une","des","les","the","and"}]
+
+    def best_sentences(self,query,items,max_sentences=7):
+        q=set(self.tokens(query)); candidates=[]
+        for item in items:
+            body=item.get('text','')
+            for sent in re.split(r"(?<=[.!?。！？])\s+|\n+",body):
+                sent=re.sub(r"\s+"," ",sent).strip()
+                if len(sent)<35 or len(sent)>650:continue
+                st=set(self.tokens(sent)); overlap=len(q & st)
+                score=overlap*6 + min(len(sent),220)/220 + (2 if item.get('source') in {'Wikipedia','Wikidata'} else 0)
+                if overlap or len(q)<=2:candidates.append((score,sent,item))
+        candidates.sort(key=lambda x:x[0],reverse=True)
+        out=[];seen=set()
+        for score,sent,item in candidates:
+            key=re.sub(r"\W+","",sent.lower())[:120]
+            if key in seen:continue
+            seen.add(key);out.append((sent,item))
+            if len(out)>=max_sentences:break
+        return out
+
+    def labels(self,lang):
+        return {
+            'fr':('Voici ce que j’ai trouvé','Sources'), 'en':('Here is what I found','Sources'),
+            'es':('Esto es lo que encontré','Fuentes'), 'de':('Das habe ich gefunden','Quellen'),
+            'it':('Ecco cosa ho trovato','Fonti'), 'pt':('Aqui está o que encontrei','Fontes'),
+            'ar':('هذا ما وجدته','المصادر'), 'ru':('Вот что удалось найти','Источники'),
+            'ja':('見つかった情報です','出典'), 'ko':('찾은 정보입니다','출처'), 'zh':('这是我找到的信息','来源')
+        }.get(lang,('Here is what I found','Sources'))
+
+    def research(self,query,lang='auto',include_news=False):
+        lang=self.detect_language(query) if not lang or lang=='auto' else lang.lower()[:3]
+        url=self.extract_url(query)
+        items=[]
+        if url:
+            page=self.fetch_page(url)
+            if page:items.append({'title':urllib.parse.urlparse(url).netloc,'url':url,'text':page,'source':'Web page'})
+        else:
+            items.extend(self.wiki(query,lang))
+            items.extend(self.wikidata(query,lang))
+            items.extend(self.ddg(query,lang))
+            items.extend(self.public_network_search(query,lang))
+            items.extend(self.stackexchange(query,lang))
+            if include_news or re.search(r"\b(aujourd'hui|actualité|actualités|news|today|latest|récent|recent)\b",query.lower()):
+                items.extend(self.news(query,lang))
+            # Fetch a few result pages when snippets are too shallow.
+            expanded=[]
+            for item in items[:4]:
+                if item.get('source')=='Web' and item.get('url'):
+                    page=self.fetch_page(item['url'])
+                    if page:
+                        x=dict(item);x['text']=page;expanded.append(x)
+            items=expanded+items
+        best=self.best_sentences(query,items)
+        if not best:return None,[]
+        intro,sources_label=self.labels(lang)
+        # Keep extracted source language rather than fabricating translation.
+        answer=intro+" :\n\n"+" ".join(x[0] for x in best)
+        unique=[];seen=set()
+        for _,it in best:
+            url=it.get('url','')
+            if url and url not in seen:
+                seen.add(url);unique.append(it)
+        if unique:
+            answer+="\n\n**"+sources_label+"**\n"+"\n".join(f"• {it.get('source','Web')} — {it.get('title','Source')} — {it.get('url','')}" for it in unique[:6])
+        return answer,unique[:6]
+
+
+class DuraBrainCore5:
+    def __init__(self, legacy):
+        self.legacy=legacy
+        self.web=DuraBrainWeb5()
+
+    def _smalltalk(self,raw,lang):
+        low=raw.lower().strip()
+        greetings={
+            'fr':'Salut. Je suis **DuraIA**, propulsée par **DuraBrain Core 5.0**. Je peux travailler avec tes données Dura, raisonner sur des calculs simples, rédiger, résumer et chercher sur le Web public dans plusieurs langues.',
+            'en':'Hi. I am **DuraIA**, powered by **DuraBrain Core 5.0**. I can work with your Dura data, do calculations, write, summarize and research the public web in multiple languages.',
+            'es':'Hola. Soy **DuraIA**, con **DuraBrain Core 5.0**. Puedo usar tus datos Dura, calcular, redactar, resumir e investigar la web pública en varios idiomas.'
+        }
+        if re.fullmatch(r"(?:bonjour|salut|hello|hey|coucou|hola|hallo|ciao)[ !?.]*",low):return greetings.get(lang,greetings['en'])
+        return None
+
+    def answer(self,message,memories,recent,ecosystem,web_enabled=True,language='auto'):
+        raw=(message or '').strip(); lang=self.web.detect_language(raw) if language in {None,'','auto'} else language.lower()
+        if not raw:return 'Écris-moi une question ou une tâche.'
+        small=self._smalltalk(raw,lang)
+        if small:return small,[]
+        low=raw.lower()
+        # Use mature deterministic tools from Core 3.5 first for calculations, Dura data, summaries and memory.
+        deterministic=False
+        if re.search(r"\d\s*[+\-*/^%]\s*\d",low):deterministic=True
+        if low.startswith(("calcule ","combien font ","combien fait ","résume ","resume ","reformule ","réécris ","reecris ","corrige ","plan ","planifie ","organise ","idées ","idees ","brainstorm ","écris ","ecris ","rédige ","redige ")):deterministic=True
+        if any(x in low for x in ["mes mails","mails non lus","mes abonnés","mes abonnes","mes vues","stats de ma chaîne","statistiques de ma chaîne","qui suis-je","que sais-tu sur moi"]):deterministic=True
+        if deterministic:
+            ans=self.legacy.answer(raw,memories,recent,ecosystem)
+            return ans,[]
+        # Direct URLs and broad factual questions go through the public-web researcher.
+        if web_enabled:
+            query=self.legacy.contextual_query(raw,recent)
+            ans,sources=self.web.research(query,lang=lang)
+            if ans:return ans,sources
+        # Last local fallback is still preferable to hallucinating.
+        ans=self.legacy.answer(raw,memories,recent,ecosystem)
+        return ans,[]
+
+
+DURABRAIN5=DuraBrainCore5(DURABRAIN3)
+
+@app.get('/v50/ai/status')
+def v50_ai_status(u:User=Depends(me),d:Session=Depends(db)):
+    access=d.query(AiAccess).filter_by(user_id=u.id).first()
+    return {'verified':bool(access and access.verified),'engine':'DuraBrain Core 5.0','external_ai_api':False,'public_web':True,'multilingual':True,'private_social_networks':False}
+
+@app.post('/v50/ai/chat')
+def v50_ai_chat(x:AiChat,u:User=Depends(me),d:Session=Depends(db)):
+    ai_verified(u,d)
+    c=d.get(AiConversation,x.conversation_id) if x.conversation_id else None
+    if not c or c.user_id!=u.id:
+        c=AiConversation(user_id=u.id,title=(x.message.strip()[:60] or 'Nouvelle conversation'));d.add(c);d.commit();d.refresh(c)
+    low=x.message.lower().strip()
+    if low.startswith('retiens que '):
+        body=x.message[11:].strip();parts=re.split(r"\s*=\s*|\s+est\s+",body,maxsplit=1)
+        if len(parts)==2:
+            key,value=parts[0].strip()[:80],parts[1].strip()[:4000]
+            row=d.query(AiMemory).filter_by(user_id=u.id,key=key).first()
+            if row:row.value=value;row.updated_at=datetime.utcnow()
+            else:d.add(AiMemory(user_id=u.id,key=key,value=value))
+            answer=f'Je retiens : {key} = {value}.';sources=[]
+        else:answer='Utilise par exemple : retiens que projet = DuraTube.';sources=[]
+    else:
+        recent_rows=d.query(AiMessage).filter_by(conversation_id=c.id).order_by(AiMessage.id.desc()).limit(18).all()
+        recent=[{'role':m.role,'content':m.content} for m in reversed(recent_rows)]
+        memories={m.key:m.value for m in d.query(AiMemory).filter_by(user_id=u.id).all()}
+        vids=d.query(Video).filter_by(owner_id=u.id).all()
+        ecosystem={'address':u.address,'has_channel':bool(u.channel_name),'channel':u.channel_name or '',
+                   'unread_mail':d.query(Mail).filter(Mail.recipient_id==u.id,Mail.trash_recipient==False,Mail.is_read==False).count(),
+                   'subscribers':d.query(Subscription).filter_by(channel_id=u.id).count() if u.channel_name else 0,
+                   'views':sum(v.views or 0 for v in vids),'likes':sum(v.likes or 0 for v in vids),'videos':len(vids)}
+        answer,sources=DURABRAIN5.answer(x.message,memories,recent,ecosystem,web_enabled=bool(x.web),language=x.language or 'auto')
+    d.add(AiMessage(conversation_id=c.id,role='user',content=x.message));d.add(AiMessage(conversation_id=c.id,role='assistant',content=answer));c.updated_at=datetime.utcnow();d.commit()
+    return {'conversation_id':c.id,'text':answer,'engine':'DuraBrain Core 5.0','sources':sources,'language':DURABRAIN5.web.detect_language(x.message)}
