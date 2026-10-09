@@ -216,7 +216,7 @@ def bootstrap():
 
 @app.get("/")
 def status():
-    return {"service":"Dura Cloud","version":"8.0","status":"online" if DATABASE_READY else "degraded",
+    return {"service":"Dura Cloud","version":"8.3","status":"online" if DATABASE_READY else "degraded",
             "release":"foundation-beta","duratube":True,"studio":True,"duramail":True,
             "duraia":"DuraBrain 8.0 (outils + modèle optionnel)","duraweb":True,"duramr":True,"duramaps":True,"database":DATABASE_READY,"r2":bool(R2_ENDPOINT),
             "warnings":CONFIG_WARNINGS}
@@ -233,13 +233,13 @@ def health():
     r2_cfg=bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET)
     secret_persistent=bool(os.getenv("DURA_SECRET","").strip())
     return {"ok":db_ok,"database":db_ok,"r2_configured":r2_cfg,"secret_persistent":secret_persistent,
-            "warnings":CONFIG_WARNINGS,"version":"8.0"}
+            "warnings":CONFIG_WARNINGS,"version":"8.3"}
 
 @app.get("/ready")
 def ready():
     if not DATABASE_READY:
         raise HTTPException(503,"Dura Cloud démarre mais la base de données n'est pas prête. Consulte /health et les logs Render.")
-    return {"ready":True,"version":"8.0"}
+    return {"ready":True,"version":"8.3"}
 
 @app.patch("/account/profile")
 def update_profile(x:ProfileIn,u:User=Depends(me),d:Session=Depends(db)):
@@ -287,7 +287,7 @@ def bootstrap_payload(u:User=Depends(me),d:Session=Depends(db)):
     if u.channel_name:
         p=d.query(ChannelProfile).filter_by(user_id=u.id).first() or ChannelProfile(user_id=u.id)
         channel_data={"name":u.channel_name,"description":p.description or "","subscribers":d.query(Subscription).filter_by(channel_id=u.id).count(),"videos":d.query(Video).filter_by(owner_id=u.id,status="published").count()}
-    return {"user":pub_user(u),"unread":unread,"theme":{k:getattr(t,k) for k in ["accent","background","surface","text","font","radius","density","graphic"]},"channel":channel_data,"version":"8.0"}
+    return {"user":pub_user(u),"unread":unread,"theme":{k:getattr(t,k) for k in ["accent","background","surface","text","font","radius","density","graphic"]},"channel":channel_data,"version":"8.3"}
 
 @app.get("/theme/me")
 def theme_me(u:User=Depends(me),d:Session=Depends(db)):
@@ -2542,3 +2542,107 @@ def v8_maps_favorite_delete(favorite_id:int,u:User=Depends(me),d:Session=Depends
     d.delete(f);d.commit();return {'deleted':True}
 
 # END DuraMaps v8
+
+
+# BEGIN Dura PRIME v8.3: compatible extension; no destructive migrations.
+# The server remains self-contained for Render's existing server.py deployment.
+import unicodedata as _prime_unicode
+from collections import Counter as _PrimeCounter
+
+_PRIME_STOP={'le','la','les','de','des','du','dans','ce','cette','cet','un','une','et','ou','avec','pour','sur','que','qui','quoi','quand','comment','est','sont','en','au','aux','je','tu','il','elle','nous','vous','ils','elles','mon','ma','mes','ton','ta','tes','votre','vos','ses','plus','moins','par','quel','quelle','quels','quelles','the','what','how','when','why','where','who','is','are','to','and','of','in','a','an','on','for','with'}
+
+def _prime_words(text):
+    plain=_prime_unicode.normalize('NFKD',str(text or '').lower())
+    plain=''.join(c for c in plain if not _prime_unicode.combining(c))
+    return [w for w in re.findall(r'[a-z0-9]{3,}',plain) if w not in _PRIME_STOP]
+
+def _prime_rank(query, rows):
+    target=set(_prime_words(query))
+    ranked=[];seen=set()
+    for i,row in enumerate(rows if isinstance(rows,list) else []):
+        if not isinstance(row,dict):continue
+        url=str(row.get('url',''))
+        if not url.startswith('https://') or url in seen:continue
+        seen.add(url)
+        heading=set(_prime_words(row.get('title','')))
+        summary=set(_prime_words(row.get('snippet','')))
+        match_heading=len(target&heading)
+        match_summary=len(target&summary)
+        score=3.5*match_heading + 1.2*match_summary + min(len(str(row.get('snippet',''))),240)/250
+        if not target:score=0
+        if 'wikipedia.org' in url and match_heading:score+=0.3
+        ranked.append((score,-i,row))
+    return sorted(ranked,key=lambda k:(k[0],k[1]),reverse=True)
+
+def _prime_local_intent(query):
+    s=' '.join(str(query or '').lower().split())
+    if len(s)<3:return True
+    if re.fullmatch(r'(ok|oui|non|merci|bonjour|salut|hello|hi|hey|coucou|thanks|thank you|ça va|ca va)[!.? ]*',s):return True
+    if re.match(r'^(bonjour|salut|hello|présente.toi|presente.toi|qui es.tu|who are you)\b',s):return True
+    if re.search(r'\b(?:\d+(?:[.,]\d+)?)\s*[+*×/÷\-^%]\s*\d',s):return True
+    prefixes=('calcule','résume ','resume ','reformule','corrige','rédige','redige','écris','ecris','invente','raconte',
+             'retiens que','souviens-toi','mes mails','mes stats','combien de mails','mes vidéos','mes videos',
+             'quel est mon compte','mon adresse duramail','que sais-tu sur moi','fais un plan','donne moi des idées','donne-moi des idées')
+    return s.startswith(prefixes)
+
+def _prime_response(question, results):
+    ranked=_prime_rank(question,results)
+    trustworthy=[(score,row) for score,_,row in ranked if score>=2.2 and len(str(row.get('snippet','')).strip())>=45]
+    if not trustworthy:
+        return ('Je ne trouve pas de source publique assez pertinente pour répondre précisément. '
+                'Essaie une question plus ciblée, ou connecte un véritable modèle de langage dans Dura Cloud.'), []
+    score,first=trustworthy[0]
+    desc=re.sub(r'\s+',' ',str(first.get('snippet','')).strip())[:600]
+    # Present evidence as evidence; we deliberately do not claim to have independently reasoned through it.
+    text='Voici ce que j’ai trouvé :\n\n'+desc
+    if len(trustworthy)>1 and trustworthy[1][0]>=2.2:
+        extra=str(trustworthy[1][1].get('snippet','')).strip()[:280]
+        if extra and extra.casefold() not in desc.casefold():text+='\n\nAutre source : '+extra
+    text+='\n\nCes informations proviennent de résultats publics, pas d’un modèle neuronal.'
+    sources=[{'title':str(row.get('title') or row.get('source') or 'Source')[:130], 'url':row.get('url')}
+             for _,row in trustworthy[:4]]
+    return text,sources
+
+@app.get('/v83/status')
+def v83_status():
+    return {'client':'Dura Ecosystem 8.3 PRIME','cloud':'8.0 + PRIME compatible',
+            'search':'resultats publics classes par pertinence','ai_model_ready':bool(DURA_MODEL_URL),
+            'ai_policy':'aucun modele neuronal sans infrastructure configuree','data_migration':False}
+
+@app.get('/v83/search')
+def v83_search(q:str=Query(min_length=1,max_length=180),lang:str='fr',limit:int=15):
+    result=search(q,lang,limit)
+    ordered=[row for _,_,row in _prime_rank(q,result.get('results',[]))]
+    desc,sources=_prime_response(q,ordered)
+    result['results']=ordered[:max(1,min(int(limit),20))]
+    result['summary']=desc if sources else 'Aucun extrait suffisamment pertinent pour une synthèse.'
+    result['summary_sources']=sources
+    result['answer_type']='synthese des extraits publics, sans modele generatif'
+    return result
+
+@app.post('/v83/ai/chat')
+def v83_ai_chat(x:AiChat,u:User=Depends(me),d:Session=Depends(db)):
+    ai_verified(u,d)
+    question=x.message.strip()
+    if not question:raise HTTPException(400,'Ecris une question.')
+    # Accounts, math, greetings, writing and memory continue using the existing trusted engine.
+    # Self-hosted LLM uses the Dura Cloud existing model routing.
+    if _prime_local_intent(question) or DURA_MODEL_URL or not x.web:
+        result=v50_ai_chat(x,u,d)
+        result['engine']=('Modèle Dura auto-hébergé (si disponible)' if DURA_MODEL_URL
+                          else 'Outils et fonctions Dura sans modèle neuronal')
+        return result
+    lookup=search(question,lang=(x.language if x.language!='auto' else 'fr'),limit=15)
+    answer,sources=_prime_response(question,lookup.get('results',[]))
+    c=d.get(AiConversation,x.conversation_id) if x.conversation_id else None
+    if not c or c.user_id!=u.id:
+        c=AiConversation(user_id=u.id,title=question[:60] or 'Recherche')
+        d.add(c);d.commit();d.refresh(c)
+    d.add(AiMessage(conversation_id=c.id,role='user',content=question))
+    d.add(AiMessage(conversation_id=c.id,role='assistant',content=answer))
+    c.updated_at=datetime.utcnow();d.commit()
+    return {'conversation_id':c.id,'text':answer,'engine':'Recherche DuraWeb · sources classées',
+            'sources':sources,'language':x.language}
+# END Dura PRIME v8.3
+
+app.version="8.3"
